@@ -25,6 +25,7 @@ from scvi.autotune._types import Tunable, TunableMixin
 logger = logging.getLogger(__name__)
 
 from .dis2pvae import Dis2pVAE
+from .data import AnnDataSplitter
 from .trainingplan import Dis2pTrainingPlan
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -78,7 +79,7 @@ class Dis2pVI(
     """
 
     _module_cls = Dis2pVAE
-    _data_splitter_cls = DataSplitter
+    _data_splitter_cls = AnnDataSplitter
     _training_plan_cls = Dis2pTrainingPlan
     _train_runner_cls = TrainRunner
 
@@ -92,6 +93,10 @@ class Dis2pVI(
             dropout_rate: float = 0.1,
             gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
             latent_distribution: Literal["normal", "ln"] = "normal",
+            split_key: str = None,
+            train_split: Union[str, List[str]] = ["train"],
+            valid_split: Union[str, List[str]] = ["valid"],
+            test_split: Union[str, List[str]] = ["ood"],
             **model_kwargs,
     ):
         super().__init__(adata)
@@ -118,6 +123,13 @@ class Dis2pVI(
             latent_distribution=latent_distribution,
             **model_kwargs,
         )
+        train_indices = np.where(adata.obs.loc[:, split_key].isin(train_split))[0]
+        valid_indices = np.where(adata.obs.loc[:, split_key].isin(valid_split))[0]
+        test_indices = np.where(adata.obs.loc[:, split_key].isin(test_split))[0]
+
+        self.train_indices = train_indices
+        self.valid_indices = valid_indices
+        self.test_indices = test_indices
         self._model_summary_string = (
             "Dis2pVI Model with the following params: \nn_hidden: {}, n_latent_shared: {}, n_latent_attribute: {}"
             ", n_layers: {}, dropout_rate: {}, gene_likelihood: {}, latent_distribution: {}"
@@ -328,12 +340,14 @@ class Dis2pVI(
 
         plan_kwargs = plan_kwargs if isinstance(plan_kwargs, dict) else {}
 
-        data_splitter = DataSplitter(
-            adata_manager=self.adata_manager,
-            train_size=train_size,
-            validation_size=validation_size,
-            batch_size=batch_size,
-        )
+        data_splitter = AnnDataSplitter(
+                self.adata_manager,
+                train_indices=self.train_indices,
+                valid_indices=self.valid_indices,
+                test_indices=self.test_indices,
+                batch_size=batch_size,
+                use_gpu=use_gpu,
+            )
         training_plan = self._training_plan_cls(self.module,
                                                 cf_weight=cf_weight,
                                                 beta=beta,
