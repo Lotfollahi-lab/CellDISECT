@@ -104,21 +104,29 @@ class Dis2pVAE(BaseModuleClass):
         # Encoders
 
         n_input_encoder = n_input
+        
         self.n_cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
 
+        self.covars_embeddings = nn.ModuleDict(
+            {
+                str(key): torch.nn.Embedding(unique_covars, n_latent_shared)
+                for key, unique_covars in enumerate(self.n_cat_list)
+            }
+        )
+        
         self.zs_num = len(self.n_cat_list)
 
         self.z_encoders_list = nn.ModuleList(
             [
                 Encoder(
-                    n_input_encoder,
+                    n_input_encoder + len(self.n_cat_list) * n_latent_shared,
                     n_latent_shared,
-                    n_cat_list=self.n_cat_list,
+                    # n_cat_list=self.n_cat_list,
                     n_layers=n_layers,
                     n_hidden=n_hidden,
                     dropout_rate=dropout_rate,
                     distribution=latent_distribution,
-                    inject_covariates=deeply_inject_covariates,
+                    # inject_covariates=deeply_inject_covariates,
                     use_batch_norm=use_batch_norm_encoder,
                     use_layer_norm=use_layer_norm_encoder,
                     var_activation=var_activation,
@@ -130,14 +138,14 @@ class Dis2pVAE(BaseModuleClass):
         self.z_encoders_list.extend(
             [
                 Encoder(
-                    n_input_encoder,
+                    n_input_encoder + len(self.n_cat_list) * n_latent_shared,
                     n_latent_attribute,
-                    n_cat_list=self.n_cat_list,
+                    # n_cat_list=self.n_cat_list,
                     n_layers=n_layers,
                     n_hidden=n_hidden,
                     dropout_rate=dropout_rate,
                     distribution=latent_distribution,
-                    inject_covariates=deeply_inject_covariates,
+                    # inject_covariates=deeply_inject_covariates,
                     use_batch_norm=use_batch_norm_encoder,
                     use_layer_norm=use_layer_norm_encoder,
                     var_activation=var_activation,
@@ -150,14 +158,14 @@ class Dis2pVAE(BaseModuleClass):
         self.z_prior_encoders_list = nn.ModuleList(
             [
                 Encoder(
-                    0,
+                    n_latent_shared,
                     n_latent_attribute,
-                    n_cat_list=[self.n_cat_list[k]],
+                    # n_cat_list=[self.n_cat_list[k]],
                     n_layers=n_layers,
                     n_hidden=n_hidden,
                     dropout_rate=dropout_rate,
                     distribution=latent_distribution,
-                    inject_covariates=deeply_inject_covariates,
+                    # inject_covariates=deeply_inject_covariates,
                     use_batch_norm=use_batch_norm_encoder,
                     use_layer_norm=use_layer_norm_encoder,
                     var_activation=var_activation,
@@ -172,12 +180,12 @@ class Dis2pVAE(BaseModuleClass):
         self.x_decoders_list = nn.ModuleList(
             [
                 DecoderSCVI(
-                    n_latent_shared,
+                    n_latent_shared + len(self.n_cat_list) * n_latent_shared,
                     n_input,
-                    n_cat_list=self.n_cat_list,
+                    # n_cat_list=self.n_cat_list,
                     n_layers=n_layers,
                     n_hidden=n_hidden,
-                    inject_covariates=deeply_inject_covariates,
+                    # inject_covariates=deeply_inject_covariates,
                     use_batch_norm=use_batch_norm_decoder,
                     use_layer_norm=use_layer_norm_decoder,
                     scale_activation="softmax",
@@ -188,12 +196,12 @@ class Dis2pVAE(BaseModuleClass):
         self.x_decoders_list.extend(
             [
                 DecoderSCVI(
-                    n_latent_attribute,
+                    n_latent_attribute * len(self.n_cat_list),
                     n_input,
-                    n_cat_list=[self.n_cat_list[i] for i in range(len(self.n_cat_list)) if i != k],
+                    # n_cat_list=[self.n_cat_list[i] for i in range(len(self.n_cat_list)) if i != k],
                     n_layers=n_layers,
                     n_hidden=n_hidden,
-                    inject_covariates=deeply_inject_covariates,
+                    # inject_covariates=deeply_inject_covariates,
                     use_batch_norm=use_batch_norm_decoder,
                     use_layer_norm=use_layer_norm_decoder,
                     scale_activation="softmax",
@@ -248,35 +256,38 @@ class Dis2pVAE(BaseModuleClass):
         library = torch.log(x.sum(1)).unsqueeze(1)
         if self.log_variational:
             x_ = torch.log(1 + x_)
-
+        
         cat_in = torch.split(cat_covs, 1, dim=1)
-
         # z_shared
-
-        qz_shared, z_shared = self.z_encoders_list[0](x_, *cat_in)
+        emb = []
+        for i, embedding in enumerate(cat_covs.t()):
+            emb.append(self.covars_embeddings[str(i)](embedding.long()))
+        prior_emb_in = emb[:]
+        emb = torch.stack(emb, dim=0)
+        emb = torch.permute(emb, (1, 0, 2))
+        emb = emb.reshape(emb.shape[0], -1)
+        qz_shared, z_shared = self.z_encoders_list[0](torch.hstack((x_, emb)))
         z_shared = z_shared.to(device)
-
+    
         # zs
-
+        
         encoders_outputs = []
-        encoders_inputs = [(x_, *cat_in) for _ in cat_in]
+        encoders_inputs = [torch.hstack((x_, emb)) for _ in cat_in]
 
         for i in range(len(self.z_encoders_list) - 1):
-            encoders_outputs.append(self.z_encoders_list[i + 1](*encoders_inputs[i]))
+            encoders_outputs.append(self.z_encoders_list[i + 1](encoders_inputs[i]))
 
         qzs = [enc_out[0] for enc_out in encoders_outputs]
         zs = [enc_out[1].to(device) for enc_out in encoders_outputs]
-
+        
         # zs_prior
-
         encoders_prior_outputs = []
-        encoders_prior_inputs = [(torch.tensor([]).to(device), c) for c in cat_in]
         for i in range(len(self.z_prior_encoders_list)):
-            encoders_prior_outputs.append(self.z_prior_encoders_list[i](*encoders_prior_inputs[i]))
+            encoders_prior_outputs.append(self.z_prior_encoders_list[i](prior_emb_in[i]))
 
         qzs_prior = [enc_out[0] for enc_out in encoders_prior_outputs]
         zs_prior = [enc_out[1].to(device) for enc_out in encoders_prior_outputs]
-
+        
         # nullify if required
 
         if nullify_shared:
@@ -314,11 +325,22 @@ class Dis2pVAE(BaseModuleClass):
         z = [z_shared] + zs
 
         cats_splits = torch.split(cat_covs, 1, dim=1)
+        emb = []
+        for i, embedding in enumerate(cat_covs.t()):
+            emb.append(self.covars_embeddings[str(i)](embedding.long()))
+        emb = torch.stack(emb, dim=0)
+        full_embs_ubd = emb.clone() # unique_covs x batch_size x emb_dim
+        emb = torch.permute(emb, (1, 0, 2))
+        emb = emb.reshape(emb.shape[0], -1)
         all_cats_but_one = []
         for i in range(self.zs_num):
-            all_cats_but_one.append([cats_splits[j] for j in range(len(cats_splits)) if j != i])
-
-        dec_cats_in = [cats_splits] + all_cats_but_one
+            cov_indices = list(set(list(range(self.zs_num)))-set([i]))
+            ith_emb = full_embs_ubd[cov_indices, :, :]
+            ith_emb = torch.permute(ith_emb, (1, 0, 2))
+            ith_emb = ith_emb.reshape(ith_emb.shape[0], -1)
+            all_cats_but_one.append(ith_emb)
+        
+        dec_cats_in = [emb] + all_cats_but_one
 
         for dec_count in range(self.zs_num + 1):
 
@@ -327,12 +349,12 @@ class Dis2pVAE(BaseModuleClass):
             dec_covs = dec_cats_in[dec_count]
 
             x_decoder_input = z[dec_count]
-
+            
             px_scale, px_r, px_rate, px_dropout = x_decoder(
                 self.dispersion,
-                x_decoder_input,
+                torch.hstack((x_decoder_input, dec_covs)),
                 library,
-                *dec_covs
+                # *dec_covs
             )
             px_r = torch.exp(self.px_r)
 
@@ -349,7 +371,6 @@ class Dis2pVAE(BaseModuleClass):
                 px = Poisson(px_rate, scale=px_scale)
 
             output_dict["px"] += [px]
-
         return output_dict
 
     def sub_forward(self, idx,
@@ -379,20 +400,33 @@ class Dis2pVAE(BaseModuleClass):
             x_ = torch.log(1 + x_)
 
         cat_in = torch.split(cat_covs, 1, dim=1)
-
-        qz, z = (self.z_encoders_list[idx](x_, *cat_in))
+        
+        emb = []
+        for i, embedding in enumerate(cat_covs.t()):
+            emb.append(self.covars_embeddings[str(i)](embedding.long()))
+        emb = torch.stack(emb, dim=0)
+        full_embs_ubd = emb.clone() # unique_covs x batch_size x emb_dim
+        emb = torch.permute(emb, (1, 0, 2))
+        emb = emb.reshape(emb.shape[0], -1)
+        
+        qz, z = (self.z_encoders_list[idx](torch.hstack((x_, emb))))
+        
         if detach_z:
             z = z.detach()
 
-        dec_cats = [cat_in[j] for j in range(len(cat_in)) if j != idx-1]
+        for i in range(self.zs_num):
+            cov_indices = list(set(list(range(self.zs_num)))-set([idx-1]))
+            ith_emb = full_embs_ubd[cov_indices, :, :]
+            ith_emb = torch.permute(ith_emb, (1, 0, 2))
+            ith_emb = ith_emb.reshape(ith_emb.shape[0], -1)    
 
         x_decoder = self.x_decoders_list[idx]
 
         px_scale, px_r, px_rate, px_dropout = x_decoder(
             self.dispersion,
-            z,
+            torch.hstack((z, ith_emb)),
             library,
-            *dec_cats
+            # *dec_cats
         )
         px_r = torch.exp(self.px_r)
 
@@ -407,7 +441,6 @@ class Dis2pVAE(BaseModuleClass):
             px = NegativeBinomial(mu=px_rate, theta=px_r, scale=px_scale)
         elif self.gene_likelihood == "poisson":
             px = Poisson(px_rate, scale=px_scale)
-
         return px
 
     def classification_logits(self, inference_outputs):
