@@ -101,8 +101,8 @@ class Dis2pVI(
     ):
         super().__init__(adata)
 
-        self._data_loader_cls = AnnDataLoader
-
+        self._data_loader_cls = AnnDataLoader 
+        self.split_key = split_key
         n_cats_per_cov = (
             self.adata_manager.get_state_registry(
                 REGISTRY_KEYS.CAT_COVS_KEY
@@ -123,13 +123,15 @@ class Dis2pVI(
             latent_distribution=latent_distribution,
             **model_kwargs,
         )
-        train_indices = np.where(adata.obs.loc[:, split_key].isin(train_split))[0]
-        valid_indices = np.where(adata.obs.loc[:, split_key].isin(valid_split))[0]
-        test_indices = np.where(adata.obs.loc[:, split_key].isin(test_split))[0]
+        if split_key is not None:
+            train_indices = np.where(adata.obs.loc[:, split_key].isin(train_split))[0]
+            valid_indices = np.where(adata.obs.loc[:, split_key].isin(valid_split))[0]
+            test_indices = np.where(adata.obs.loc[:, split_key].isin(test_split))[0]
 
-        self.train_indices = train_indices
-        self.valid_indices = valid_indices
-        self.test_indices = test_indices
+            self.train_indices = train_indices
+            self.valid_indices = valid_indices
+            self.test_indices = test_indices
+            
         self._model_summary_string = (
             "Dis2pVI Model with the following params: \nn_hidden: {}, n_latent_shared: {}, n_latent_attribute: {}"
             ", n_layers: {}, dropout_rate: {}, gene_likelihood: {}, latent_distribution: {}"
@@ -340,7 +342,8 @@ class Dis2pVI(
 
         plan_kwargs = plan_kwargs if isinstance(plan_kwargs, dict) else {}
 
-        data_splitter = AnnDataSplitter(
+        if self.split_key is not None:
+            data_splitter = AnnDataSplitter(
                 self.adata_manager,
                 train_indices=self.train_indices,
                 valid_indices=self.valid_indices,
@@ -348,6 +351,14 @@ class Dis2pVI(
                 batch_size=batch_size,
                 use_gpu=use_gpu,
             )
+        else:
+            data_splitter = DataSplitter(
+                adata_manager=self.adata_manager,
+                train_size=train_size,
+                validation_size=validation_size,
+                batch_size=batch_size,
+            )
+            
         training_plan = self._training_plan_cls(self.module,
                                                 cf_weight=cf_weight,
                                                 beta=beta,

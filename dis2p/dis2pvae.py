@@ -84,6 +84,8 @@ class Dis2pVAE(BaseModuleClass):
             use_batch_norm: Tunable[Literal["encoder", "decoder", "none", "both"]] = "both",
             use_layer_norm: Tunable[Literal["encoder", "decoder", "none", "both"]] = "none",
             var_activation: Optional[Callable] = None,
+            use_custom_embs: bool = False,
+            embeddings: Union[torch.Tensor, List[torch.Tensor]] = None
     ):
         super().__init__()
         self.dispersion = "gene"
@@ -106,13 +108,23 @@ class Dis2pVAE(BaseModuleClass):
         n_input_encoder = n_input
         
         self.n_cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
-
-        self.covars_embeddings = nn.ModuleDict(
-            {
-                str(key): torch.nn.Embedding(unique_covars, n_latent_shared)
-                for key, unique_covars in enumerate(self.n_cat_list)
-            }
-        )
+        
+        if use_custom_embs:
+            self.covars_embeddings = nn.ModuleDict(
+                {
+                    str(key): torch.nn.Embedding(embedding.shape[0], embedding.shape[1])
+                    for key, embedding in enumerate(list(embeddings))
+                }
+            )
+            drug_embeddings.weight.data.copy_(embeddings)
+            drug_embeddings.weight.requires_grad = False
+        else:
+            self.covars_embeddings = nn.ModuleDict(
+                {
+                    str(key): torch.nn.Embedding(unique_covars, n_latent_shared)
+                    for key, unique_covars in enumerate(self.n_cat_list)
+                }
+            )
         
         self.zs_num = len(self.n_cat_list)
 

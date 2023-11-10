@@ -48,10 +48,6 @@ class AnnDataSplitter(DataSplitter):
     def val_dataloader(self):
         if len(self.val_idx) > 0:
             data_loader_kwargs = self.data_loader_kwargs.copy()
-            # if len(self.valid_indices < 4096):
-            #     data_loader_kwargs.update({'batch_size': len(self.valid_indices)})
-            # else:
-            #     data_loader_kwargs.update({'batch_size': 2048})
             return AnnDataLoader(
                 self.adata_manager,
                 indices=self.val_idx,
