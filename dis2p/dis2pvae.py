@@ -108,16 +108,15 @@ class Dis2pVAE(BaseModuleClass):
         n_input_encoder = n_input
         
         self.n_cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
-        
         if use_custom_embs:
             self.covars_embeddings = nn.ModuleDict(
                 {
                     str(key): torch.nn.Embedding(embedding.shape[0], embedding.shape[1])
-                    for key, embedding in enumerate(list(embeddings))
+                    for key, embedding in enumerate([embeddings])
                 }
             )
-            drug_embeddings.weight.data.copy_(embeddings)
-            drug_embeddings.weight.requires_grad = False
+            self.covars_embeddings['0'].weight.data.copy_(embeddings)
+            self.covars_embeddings['0'].weight.requires_grad = False
         else:
             self.covars_embeddings = nn.ModuleDict(
                 {
@@ -125,6 +124,9 @@ class Dis2pVAE(BaseModuleClass):
                     for key, unique_covars in enumerate(self.n_cat_list)
                 }
             )
+            
+        emb_dim_reducer = nn.Linear(self.covars_embeddings['0'].weight.shape[1], n_latent_shared)
+        self.pert_encoder = emb_dim_reducer if use_custom_embs else nn.Identity()
         
         self.zs_num = len(self.n_cat_list)
 
@@ -170,7 +172,7 @@ class Dis2pVAE(BaseModuleClass):
         self.z_prior_encoders_list = nn.ModuleList(
             [
                 Encoder(
-                    n_latent_shared,
+                    n_latent_shared if use_custom_embs == False else embeddings.shape[1],
                     n_latent_attribute,
                     # n_cat_list=[self.n_cat_list[k]],
                     n_layers=n_layers,
@@ -277,6 +279,7 @@ class Dis2pVAE(BaseModuleClass):
         prior_emb_in = emb[:]
         emb = torch.stack(emb, dim=0)
         emb = torch.permute(emb, (1, 0, 2))
+        emb = self.pert_encoder(emb)
         emb = emb.reshape(emb.shape[0], -1)
         qz_shared, z_shared = self.z_encoders_list[0](torch.hstack((x_, emb)))
         z_shared = z_shared.to(device)
@@ -343,6 +346,7 @@ class Dis2pVAE(BaseModuleClass):
         emb = torch.stack(emb, dim=0)
         full_embs_ubd = emb.clone() # unique_covs x batch_size x emb_dim
         emb = torch.permute(emb, (1, 0, 2))
+        emb = self.pert_encoder(emb)
         emb = emb.reshape(emb.shape[0], -1)
         all_cats_but_one = []
         for i in range(self.zs_num):
@@ -419,6 +423,7 @@ class Dis2pVAE(BaseModuleClass):
         emb = torch.stack(emb, dim=0)
         full_embs_ubd = emb.clone() # unique_covs x batch_size x emb_dim
         emb = torch.permute(emb, (1, 0, 2))
+        emb = self.pert_encoder(emb)
         emb = emb.reshape(emb.shape[0], -1)
         
         qz, z = (self.z_encoders_list[idx](torch.hstack((x_, emb))))
