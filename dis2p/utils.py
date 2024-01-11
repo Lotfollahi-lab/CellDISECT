@@ -1,4 +1,5 @@
 from typing import List
+from torch import nn
 import torch
 from scvi.nn import one_hot
 
@@ -52,3 +53,61 @@ def one_hot_cat(n_cat_list: List[int], cat_covs: torch.Tensor):
             one_hot_cat_list += [onehot_cat]
     u_cat = torch.cat(*one_hot_cat_list) if len(one_hot_cat_list) > 1 else one_hot_cat_list[0]
     return u_cat
+
+class PerturbationNetwork(nn.Module): # from CPA code
+    def __init__(self,
+                 n_perts,
+                 n_latent,
+                 doser_type='logsigm',
+                 n_hidden=None,
+                 n_layers=None,
+                 dropout_rate: float = 0.0,
+                 drug_embeddings=None,):
+        super().__init__()
+        self.n_latent = n_latent
+        
+        if drug_embeddings is not None:
+            self.pert_embedding = drug_embeddings
+            self.pert_transformation = nn.Linear(drug_embeddings.embedding_dim, n_latent)
+            self.use_rdkit = True
+        else:
+            self.use_rdkit = False
+            self.pert_embedding = nn.Embedding(n_perts, n_latent, padding_idx=CPA_REGISTRY_KEYS.PADDING_IDX)
+            
+        self.doser_type = doser_type
+        if self.doser_type == 'mlp':
+            self.dosers = nn.ModuleList()
+            for _ in range(n_perts):
+                self.dosers.append(
+                    FCLayers(
+                        n_in=1,
+                        n_out=1,
+                        n_hidden=n_hidden,
+                        n_layers=n_layers,
+                        use_batch_norm=False,
+                        use_layer_norm=True,
+                        dropout_rate=dropout_rate
+                    )
+                )
+        else:
+            self.dosers = GeneralizedSigmoid(n_perts, non_linearity=self.doser_type)
+
+    def forward(self, perts, dosages):
+        """
+            perts: (batch_size, max_comb_len)
+            dosages: (batch_size, max_comb_len)
+        """
+        bs, max_comb_len = perts.shape
+        perts = perts.long()
+        scaled_dosages = self.dosers(dosages, perts)  # (batch_size, max_comb_len)
+
+        drug_embeddings = self.pert_embedding(perts)  # (batch_size, max_comb_len, n_drug_emb_dim)
+
+        if self.use_rdkit:
+            drug_embeddings = self.pert_transformation(drug_embeddings.view(bs * max_comb_len, -1)).view(bs, max_comb_len, -1)
+
+        z_drugs = torch.einsum('bm,bme->bme', [scaled_dosages, drug_embeddings])  # (batch_size, n_latent)
+
+        z_drugs = torch.einsum('bmn,bm->bmn', z_drugs, (perts != 0).int()).sum(dim=1)  # mask single perts
+
+        return z_drugs # (batch_size, n_latent)
