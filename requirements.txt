@@ -1,6 +1,6 @@
 scvi-tools
 scanpy
-pytorch
+torch
 sklearn
 matplotlib
 scipy
