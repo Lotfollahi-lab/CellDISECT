@@ -16,6 +16,11 @@ from celldisect.utils import LOSS_KEYS
 from .utils import *
 from scvi.train._metrics import ElboMetric
 
+import logging
+# Configure logging to prevent duplicate messages
+logging.getLogger('lightning.pytorch.utilities.rank_zero').setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Define LOSS_KEYS_LIST for metrics initialization

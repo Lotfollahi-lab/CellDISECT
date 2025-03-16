@@ -37,6 +37,16 @@ from scvi.train._callbacks import SaveBestState
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+def set_seed(seed):
+    """Set seed for all random number generators for reproducibility."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    np.random.seed(seed)
+    random.seed(seed)
 
 class CellDISECT(
     RNASeqMixin,
@@ -702,6 +712,11 @@ class CellDISECT(
         -------
         None
         """
+        # Ensure reproducibility by setting all seeds
+        from scvi import settings
+        if hasattr(settings, 'seed') and settings.seed is not None:
+            set_seed(settings.seed)
+        
         n_cells = self.adata.n_obs
         if max_epochs is None:
             max_epochs = int(np.min([round((20000 / n_cells) * 400), 400]))
