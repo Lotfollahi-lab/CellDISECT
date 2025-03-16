@@ -29,3 +29,8 @@ search:
     tutorials/index: 3
     installation: 2
     index: 1
+
+# Configure multiple versions
+submodules:
+  include: all
+  recursive: true

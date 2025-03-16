@@ -1,3 +1,7 @@
+# CellDISECT
+
+> **⚠️ BETA VERSION NOTICE**: This is version 0.2.0b1, a beta release with compatibility updates for Google Colab and newer versions of torch and scvi-tools. For the stable version, please see the main branch.
+
 # <img src="https://github.com/Lotfollahi-lab/celldisect/blob/main/media/CellDISECT_Logo_whitebg.png" width="1000" alt="celldisect-logo">
 
 <div align="center">

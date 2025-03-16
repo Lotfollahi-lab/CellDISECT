@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "celldisect"
-version = "0.1.3"
+version = "0.2.0b1"
 description = "Cell DISentangled Experts for Covariate counTerfactuals (CellDISECT). Causal generative model designed to disentangle known covariate variations from unknown ones at test time while simultaneously learning to make counterfactual predictions."
 authors = ["Arian Amani <aa34@sanger.ac.uk> Stathis Megas <sm58@sanger.ac.uk>"]
 license = "BSD-3-Clause"

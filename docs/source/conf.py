@@ -8,7 +8,7 @@ copyright = '2024, Arian Amani, Stathis Megas'
 author = 'Arian Amani, Stathis Megas'
 
 # The full version, including alpha/beta/rc tags
-release = '0.1.1'
+release = '0.2.0b1'
 version = '.'.join(release.split('.')[:2])  # Major.Minor version
 
 # General configuration
@@ -41,10 +41,10 @@ extensions = [
 ]
 
 # Version configuration
-smv_tag_whitelist = r'^v\d+\.\d+\.\d+$'  # Include version tags like v0.1.0
-smv_branch_whitelist = r'^(main|develop)$'  # Include main and develop branches
+smv_tag_whitelist = r'^v\d+\.\d+\.\d+.*$'  # Include version tags like v0.1.0, v0.2.0b1
+smv_branch_whitelist = r'^(main|develop|beta-colab)$'  # Include main, develop, and beta branches
 smv_remote_whitelist = r'^(origin)$'
-smv_released_pattern = r'^tags/v\d+\.\d+\.\d+$'  # Released versions pattern
+smv_released_pattern = r'^tags/v\d+\.\d+\.\d+.*$'  # Released versions pattern
 smv_outputdir_format = '{ref.name}'
 
 # Myst Parser settings
