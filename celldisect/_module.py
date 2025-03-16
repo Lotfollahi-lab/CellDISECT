@@ -8,7 +8,6 @@ from torch.distributions import kl_divergence as kl
 from torchmetrics import Accuracy, F1Score
 
 from scvi import REGISTRY_KEYS
-from scvi.autotune._types import Tunable
 from scvi.distributions import NegativeBinomial, Poisson, ZeroInflatedNegativeBinomial
 from scvi.module.base import BaseModuleClass, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder
@@ -30,29 +29,29 @@ class CellDISECTModule(BaseModuleClass):
     ----------
     n_input : int
         Number of input genes.
-    n_hidden : Tunable[int], optional
+    n_hidden : int, optional
         Number of nodes per hidden layer, by default 128.
-    n_latent_shared : Tunable[int], optional
+    n_latent_shared : int, optional
         Dimensionality of the shared latent space (Z_{-s}), by default 10.
-    n_latent_attribute : Tunable[int], optional
+    n_latent_attribute : int, optional
         Dimensionality of the latent space for each sensitive attribute (Z_{s_i}), by default 10.
-    n_layers : Tunable[int], optional
+    n_layers : int, optional
         Number of hidden layers used for encoder and decoder NNs, by default 1.
     n_cats_per_cov : Optional[Iterable[int]], optional
         Number of categories for each extra categorical covariate, by default None.
-    dropout_rate : Tunable[float], optional
+    dropout_rate : float, optional
         Dropout rate for neural networks, by default 0.1.
     log_variational : bool, optional
         Log(data+1) prior to encoding for numerical stability. Not normalization, by default True.
-    gene_likelihood : Tunable[Literal["zinb", "nb", "poisson"]], optional
+    gene_likelihood : Literal["zinb", "nb", "poisson"], optional
         One of 'nb' (Negative binomial distribution), 'zinb' (Zero-inflated negative binomial distribution), or 'poisson' (Poisson distribution), by default "zinb".
-    latent_distribution : Tunable[Literal["normal", "ln"]], optional
+    latent_distribution : Literal["normal", "ln"], optional
         One of 'normal' (Isotropic normal) or 'ln' (Logistic normal with normal params N(0, 1)), by default "normal".
-    deeply_inject_covariates : Tunable[bool], optional
+    deeply_inject_covariates : bool, optional
         Whether to concatenate covariates into output of hidden layers in encoder/decoder. This option only applies when `n_layers` > 1. The covariates are concatenated to the input of subsequent hidden layers, by default True.
-    use_batch_norm : Tunable[Literal["encoder", "decoder", "none", "both"]], optional
+    use_batch_norm : Literal["encoder", "decoder", "none", "both"], optional
         Whether to use batch norm in layers, by default "both".
-    use_layer_norm : Tunable[Literal["encoder", "decoder", "none", "both"]], optional
+    use_layer_norm : Literal["encoder", "decoder", "none", "both"], optional
         Whether to use layer norm in layers, by default "none".
     var_activation : Optional[Callable], optional
         Callable used to ensure positivity of the variational distributions' variance. When `None`, defaults to `torch.exp`, by default None.
@@ -67,18 +66,18 @@ class CellDISECTModule(BaseModuleClass):
     def __init__(
             self,
             n_input: int,
-            n_hidden: Tunable[int] = 128,
-            n_latent_shared: Tunable[int] = 10,
-            n_latent_attribute: Tunable[int] = 10,
-            n_layers: Tunable[int] = 1,
+            n_hidden: int = 128,
+            n_latent_shared: int = 10,
+            n_latent_attribute: int = 10,
+            n_layers: int = 1,
             n_cats_per_cov: Optional[Iterable[int]] = None,
-            dropout_rate: Tunable[float] = 0.1,
+            dropout_rate: float = 0.1,
             log_variational: bool = True,
-            gene_likelihood: Tunable[Literal["zinb", "nb", "poisson"]] = "zinb",
-            latent_distribution: Tunable[Literal["normal", "ln"]] = "normal",
-            deeply_inject_covariates: Tunable[bool] = True,
-            use_batch_norm: Tunable[Literal["encoder", "decoder", "none", "both"]] = "both",
-            use_layer_norm: Tunable[Literal["encoder", "decoder", "none", "both"]] = "none",
+            gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
+            latent_distribution: Literal["normal", "ln"] = "normal",
+            deeply_inject_covariates: bool = True,
+            use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "both",
+            use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
             var_activation: Optional[Callable] = None,
             use_custom_embs: bool = False,
             embeddings: Union[torch.Tensor, List[torch.Tensor]] = None,
@@ -916,11 +915,11 @@ class CellDISECTModule(BaseModuleClass):
             tensors,
             inference_outputs,
             generative_outputs,
-            recon_weight: Tunable[Union[float, int]], # RECONST_LOSS_X weight
-            cf_weight: Tunable[Union[float, int]],  # RECONST_LOSS_X_CF weight
-            beta: Tunable[Union[float, int]],  # KL Zi weight
-            clf_weight: Tunable[Union[float, int]],  # Si classifier weight
-            n_cf: Tunable[int],  # number of X_cf recons (X_cf = a random permutation of X)
+            recon_weight: Union[float, int], # RECONST_LOSS_X weight
+            cf_weight: Union[float, int],  # RECONST_LOSS_X_CF weight
+            beta: Union[float, int],  # KL Zi weight
+            clf_weight: Union[float, int],  # Si classifier weight
+            n_cf: int,  # number of X_cf recons (X_cf = a random permutation of X)
             kl_weight: float = 1.0,
             ensemble_method_cf=True,
     ):
@@ -935,15 +934,15 @@ class CellDISECTModule(BaseModuleClass):
             Dictionary containing the outputs from the inference step.
         generative_outputs : dict
             Dictionary containing the outputs from the generative step.
-        recon_weight : Tunable[Union[float, int]]
+        recon_weight : Union[float, int]
             Weight for the reconstruction loss of X.
-        cf_weight : Tunable[Union[float, int]]
+        cf_weight : Union[float, int]
             Weight for the reconstruction loss of X_cf.
-        beta : Tunable[Union[float, int]]
+        beta : Union[float, int]
             Weight for the KL divergence of Zi.
-        clf_weight : Tunable[Union[float, int]]
+        clf_weight : Union[float, int]
             Weight for the Si classifier loss.
-        n_cf : Tunable[int]
+        n_cf : int
             Number of X_cf reconstructions (X_cf = a random permutation of X).
         kl_weight : float, optional
             Weight for the KL divergence, by default 1.0.

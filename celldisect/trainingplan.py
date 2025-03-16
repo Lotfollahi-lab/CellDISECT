@@ -15,7 +15,6 @@ from .utils import *
 from scvi.train._metrics import ElboMetric
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-from scvi.autotune._types import Tunable
 
 class CellDISECTTrainingPlan(TrainingPlan):
     """
@@ -25,47 +24,47 @@ class CellDISECTTrainingPlan(TrainingPlan):
     ----------
     module : BaseModuleClass
         A module instance from class ``BaseModuleClass``.
-    recon_weight : Tunable[Union[float, int]]
+    recon_weight : Union[float, int]
         Weight for the reconstruction loss of X.
-    cf_weight : Tunable[Union[float, int]]
+    cf_weight : Union[float, int]
         Weight for the reconstruction loss of X_cf.
-    beta : Tunable[Union[float, int]]
+    beta : Union[float, int]
         Weight for the KL divergence of Zi.
-    clf_weight : Tunable[Union[float, int]]
+    clf_weight : Union[float, int]
         Weight for the Si classifier loss.
-    adv_clf_weight : Tunable[Union[float, int]]
+    adv_clf_weight : Union[float, int]
         Weight for the adversarial classifier loss.
-    adv_period : Tunable[int]
+    adv_period : int
         Adversarial training period.
-    n_cf : Tunable[int]
+    n_cf : int
         Number of X_cf reconstructions (a random permutation of n VAEs and a random half-batch subset for each trial).
-    optimizer : Tunable[Literal["Adam", "AdamW", "Custom"]], optional
+    optimizer : Literal["Adam", "AdamW", "Custom"], optional
         One of "Adam" (:class:`~torch.optim.Adam`), "AdamW" (:class:`~torch.optim.AdamW`),
         or "Custom", which requires a custom optimizer creator callable to be passed via
         `optimizer_creator`. Default is "Adam".
     optimizer_creator : Optional[TorchOptimizerCreator], optional
         A callable taking in parameters and returning a :class:`~torch.optim.Optimizer`.
         This allows using any PyTorch optimizer with custom hyperparameters. Default is None.
-    lr : Tunable[float], optional
+    lr : float, optional
         Learning rate used for optimization, when `optimizer_creator` is None. Default is 1e-3.
-    weight_decay : Tunable[float], optional
+    weight_decay : float, optional
         Weight decay used in optimization, when `optimizer_creator` is None. Default is 1e-6.
-    n_steps_kl_warmup : Tunable[int], optional
+    n_steps_kl_warmup : int, optional
         Number of training steps (minibatches) to scale weight on KL divergences from 0 to 1.
         Only activated when `n_epochs_kl_warmup` is set to None. Default is None.
-    n_epochs_kl_warmup : Tunable[int], optional
+    n_epochs_kl_warmup : int, optional
         Number of epochs to scale weight on KL divergences from 0 to 1.
         Overrides `n_steps_kl_warmup` when both are not `None`. Default is 400.
-    n_epochs_pretrain_ae : Tunable[int], optional
+    n_epochs_pretrain_ae : int, optional
         Number of epochs to pretrain the autoencoder. Default is 0.
-    reduce_lr_on_plateau : Tunable[bool], optional
+    reduce_lr_on_plateau : bool, optional
         Whether to monitor validation loss and reduce learning rate when validation set
         `lr_scheduler_metric` plateaus. Default is True.
-    lr_factor : Tunable[float], optional
+    lr_factor : float, optional
         Factor to reduce learning rate. Default is 0.6.
-    lr_patience : Tunable[int], optional
+    lr_patience : int, optional
         Number of epochs with no improvement after which learning rate will be reduced. Default is 30.
-    lr_threshold : Tunable[float], optional
+    lr_threshold : float, optional
         Threshold for measuring the new optimum. Default is 0.0.
     lr_scheduler_metric : Literal["loss_validation"], optional
         Metric to monitor for learning rate reduction. Default is "loss_validation".
@@ -88,24 +87,24 @@ class CellDISECTTrainingPlan(TrainingPlan):
         self,
         module: BaseModuleClass,
         *,
-        recon_weight: Tunable[Union[float, int]] = 1.0,
-        cf_weight: Tunable[Union[float, int]] = 1.0,
-        beta: Tunable[Union[float, int]] = 1.0,
-        clf_weight: Tunable[Union[float, int]] = 1.0,
-        adv_clf_weight: Tunable[Union[float, int]] = 1.0,
-        adv_period: Tunable[int] = 10,
-        n_cf: Tunable[int] = 1,
-        optimizer: Tunable[Literal["Adam", "AdamW", "Custom"]] = "Adam",
+        recon_weight: Union[float, int] = 1.0,
+        cf_weight: Union[float, int] = 1.0,
+        beta: Union[float, int] = 1.0,
+        clf_weight: Union[float, int] = 1.0,
+        adv_clf_weight: Union[float, int] = 1.0,
+        adv_period: int = 10,
+        n_cf: int = 1,
+        optimizer: Literal["Adam", "AdamW", "Custom"] = "Adam",
         optimizer_creator: Optional[TorchOptimizerCreator] = None,
-        lr: Tunable[float] = 1e-3,
-        weight_decay: Tunable[float] = 1e-6,
-        n_steps_kl_warmup: Tunable[int] = None,
-        n_epochs_kl_warmup: Tunable[int] = 400,
-        n_epochs_pretrain_ae: Tunable[int] = 0,
-        reduce_lr_on_plateau: Tunable[bool] = True,
-        lr_factor: Tunable[float] = 0.6,
-        lr_patience: Tunable[int] = 30,
-        lr_threshold: Tunable[float] = 0.0,
+        lr: float = 1e-3,
+        weight_decay: float = 1e-6,
+        n_steps_kl_warmup: Optional[int] = None,
+        n_epochs_kl_warmup: Optional[int] = 400,
+        n_epochs_pretrain_ae: int = 0,
+        reduce_lr_on_plateau: bool = True,
+        lr_factor: float = 0.6,
+        lr_patience: int = 30,
+        lr_threshold: float = 0.0,
         lr_scheduler_metric: Literal["loss_validation"] = "loss_validation",
         lr_min: float = 0,
         scale_adversarial_loss: Union[float, Literal["auto"]] = "auto",
@@ -120,47 +119,47 @@ class CellDISECTTrainingPlan(TrainingPlan):
         ----------
         module : BaseModuleClass
             A module instance from class ``BaseModuleClass``.
-        recon_weight : Tunable[Union[float, int]]
+        recon_weight : Union[float, int]
             Weight for the reconstruction loss of X.
-        cf_weight : Tunable[Union[float, int]]
+        cf_weight : Union[float, int]
             Weight for the reconstruction loss of X_cf.
-        beta : Tunable[Union[float, int]]
+        beta : Union[float, int]
             Weight for the KL divergence of Zi.
-        clf_weight : Tunable[Union[float, int]]
+        clf_weight : Union[float, int]
             Weight for the Si classifier loss.
-        adv_clf_weight : Tunable[Union[float, int]]
+        adv_clf_weight : Union[float, int]
             Weight for the adversarial classifier loss.
-        adv_period : Tunable[int]
+        adv_period : int
             Adversarial training period.
-        n_cf : Tunable[int]
+        n_cf : int
             Number of X_cf reconstructions (a random permutation of n VAEs and a random half-batch subset for each trial).
-        optimizer : Tunable[Literal["Adam", "AdamW", "Custom"]], optional
+        optimizer : Literal["Adam", "AdamW", "Custom"], optional
             One of "Adam" (:class:`~torch.optim.Adam`), "AdamW" (:class:`~torch.optim.AdamW`),
             or "Custom", which requires a custom optimizer creator callable to be passed via
             `optimizer_creator`. Default is "Adam".
         optimizer_creator : Optional[TorchOptimizerCreator], optional
             A callable taking in parameters and returning a :class:`~torch.optim.Optimizer`.
             This allows using any PyTorch optimizer with custom hyperparameters. Default is None.
-        lr : Tunable[float], optional
+        lr : float, optional
             Learning rate used for optimization, when `optimizer_creator` is None. Default is 1e-3.
-        weight_decay : Tunable[float], optional
+        weight_decay : float, optional
             Weight decay used in optimization, when `optimizer_creator` is None. Default is 1e-6.
-        n_steps_kl_warmup : Tunable[int], optional
+        n_steps_kl_warmup : int, optional
             Number of training steps (minibatches) to scale weight on KL divergences from 0 to 1.
             Only activated when `n_epochs_kl_warmup` is set to None. Default is None.
-        n_epochs_kl_warmup : Tunable[int], optional
+        n_epochs_kl_warmup : int, optional
             Number of epochs to scale weight on KL divergences from 0 to 1.
             Overrides `n_steps_kl_warmup` when both are not `None`. Default is 400.
-        n_epochs_pretrain_ae : Tunable[int], optional
+        n_epochs_pretrain_ae : int, optional
             Number of epochs to pretrain the autoencoder. Default is 0.
-        reduce_lr_on_plateau : Tunable[bool], optional
+        reduce_lr_on_plateau : bool, optional
             Whether to monitor validation loss and reduce learning rate when validation set
             `lr_scheduler_metric` plateaus. Default is True.
-        lr_factor : Tunable[float], optional
+        lr_factor : float, optional
             Factor to reduce learning rate. Default is 0.6.
-        lr_patience : Tunable[int], optional
+        lr_patience : int, optional
             Number of epochs with no improvement after which learning rate will be reduced. Default is 30.
-        lr_threshold : Tunable[float], optional
+        lr_threshold : float, optional
             Threshold for measuring the new optimum. Default is 0.0.
         lr_scheduler_metric : Literal["loss_validation"], optional
             Which metric to track for learning rate reduction. Default is "loss_validation".

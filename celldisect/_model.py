@@ -27,7 +27,6 @@ from scvi.dataloaders._data_splitting import DataSplitter
 from scvi.dataloaders._ann_dataloader import AnnDataLoader
 from scvi.train import TrainRunner
 from scvi.model.base import RNASeqMixin, VAEMixin, BaseModelClass
-from scvi.autotune._types import Tunable, TunableMixin
 logger = logging.getLogger(__name__)
 
 from ._module import CellDISECTModule
@@ -43,8 +42,7 @@ class CellDISECT(
     RNASeqMixin,
     VAEMixin,
     UnsupervisedTrainingMixin,
-    BaseModelClass,
-    TunableMixin
+    BaseModelClass
 ):
     """CellDISECT model for single-cell RNA sequencing data analysis.
 
@@ -639,13 +637,13 @@ class CellDISECT(
             early_stopping: bool = True,
             save_best: bool = False,
             plan_kwargs: Optional[dict] = None,
-            recon_weight: Tunable[Union[float, int]] = 10, # RECONST_LOSS_X weight
-            cf_weight: Tunable[Union[float, int]] = 1,  # RECONST_LOSS_X_CF weight
-            beta: Tunable[Union[float, int]] = 1,  # KL Zi weight
-            clf_weight: Tunable[Union[float, int]] = 50,  # Si classifier weight
-            adv_clf_weight: Tunable[Union[float, int]] = 10,  # adversarial classifier weight
-            adv_period: Tunable[int] = 1,  # adversarial training period
-            n_cf: Tunable[int] = 10,  # number of X_cf recons (a random permutation of n VAEs and a random half-batch subset for each trial)
+            recon_weight: float = 10, # RECONST_LOSS_X weight
+            cf_weight: float = 1,  # RECONST_LOSS_X_CF weight
+            beta: float = 1,  # KL Zi weight
+            clf_weight: float = 50,  # Si classifier weight
+            adv_clf_weight: float = 10,  # adversarial classifier weight
+            adv_period: int = 1,  # adversarial training period
+            n_cf: int = 10,  # number of X_cf recons (a random permutation of n VAEs and a random half-batch subset for each trial)
             kappa_optimizer2: bool = True,
             n_epochs_pretrain_ae: int = 0,
             **trainer_kwargs,
@@ -671,19 +669,19 @@ class CellDISECT(
             Save the best model state with respect to the validation loss (default), or use the final state in the training procedure.
         plan_kwargs : Optional[dict]
             Keyword arguments for :class:`~scvi.train.TrainingPlan`. Keyword arguments passed to `train()` will overwrite values present in `plan_kwargs`, when appropriate.
-        recon_weight : Tunable[Union[float, int]]
+        recon_weight : float
             Weight for the reconstruction loss of X.
-        cf_weight : Tunable[Union[float, int]]
+        cf_weight : float
             Weight for the reconstruction loss of X_cf.
-        beta : Tunable[Union[float, int]]
+        beta : float
             Weight for the KL divergence of Zi.
-        clf_weight : Tunable[Union[float, int]]
+        clf_weight : float
             Weight for the Si classifier loss.
-        adv_clf_weight : Tunable[Union[float, int]]
+        adv_clf_weight : float
             Weight for the adversarial classifier loss.
-        adv_period : Tunable[int]
+        adv_period : int
             Adversarial training period.
-        n_cf : Tunable[int]
+        n_cf : int
             Number of X_cf reconstructions (a random permutation of n VAEs and a random half-batch subset for each trial).
         kappa_optimizer2 : bool
             Whether to use the second kappa optimizer.
