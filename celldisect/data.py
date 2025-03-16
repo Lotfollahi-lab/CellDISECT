@@ -31,12 +31,9 @@ class AnnDataSplitter(DataSplitter):
         else:
             self.device = torch.device("cpu")
             accelerator = "cpu"
-            
-        self.pin_memory = (
-            True
-            if (settings.dl_pin_memory_gpu_training and accelerator == "gpu")
-            else False
-        )
+        # Set pin_memory directly based on accelerator type
+        # Not using deprecated settings.dl_pin_memory_gpu_training
+        self.pin_memory = accelerator == "gpu"
 
     def train_dataloader(self):
         if len(self.train_idx) > 0:
