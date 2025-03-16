@@ -1,5 +1,5 @@
 import random
-from typing import Callable, Iterable, Literal, Optional, Union
+from typing import Callable, Iterable, Literal, Optional, Union, List, Dict
 
 import torch
 import torch.nn.functional as F
@@ -12,10 +12,11 @@ from scvi.autotune._types import Tunable
 from scvi.distributions import NegativeBinomial, Poisson, ZeroInflatedNegativeBinomial
 from scvi.module.base import BaseModuleClass, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder
+from scvi.module.base import LossOutput
 
 torch.backends.cudnn.benchmark = True
 from .utils import *
-from scvi.module._classifier import Classifier
+from scvi.module import Classifier
 
 dim_indices = 0
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -442,6 +443,7 @@ class CellDISECTModule(BaseModuleClass):
             # embeddings for all covariates except the ith one
             ith_emb = full_embs_ubd[cov_indices, :, :] # (unique_covs-1) x batch_size x emb_dim
             ith_emb = torch.permute(ith_emb, (1, 0, 2)) # batch_size x (unique_covs-1) x emb_dim
+            ith_emb = self.pert_encoder(ith_emb)
             ith_emb = ith_emb.reshape(ith_emb.shape[0], -1) # batch_size x ((unique_covs-1) * emb_dim)
             all_cats_but_one.append(ith_emb)
 
@@ -530,11 +532,12 @@ class CellDISECTModule(BaseModuleClass):
         if detach_z:
             z = z.detach()
 
-        for i in range(self.zs_num):
-            cov_indices = list(set(list(range(self.zs_num)))-set([idx-1]))
-            ith_emb = full_embs_ubd[cov_indices, :, :]
-            ith_emb = torch.permute(ith_emb, (1, 0, 2))
-            ith_emb = ith_emb.reshape(ith_emb.shape[0], -1)    
+        # Get embeddings for all covariates except the one at idx-1
+        cov_indices = list(set(range(self.zs_num)) - {idx-1})
+        ith_emb = full_embs_ubd[cov_indices, :, :]
+        ith_emb = torch.permute(ith_emb, (1, 0, 2))
+        ith_emb = self.pert_encoder(ith_emb)
+        ith_emb = ith_emb.reshape(ith_emb.shape[0], -1)    
 
         x_decoder = self.x_decoders_list[idx]
 
@@ -949,8 +952,8 @@ class CellDISECTModule(BaseModuleClass):
 
         Returns
         -------
-        dict
-            Dictionary containing the computed losses and metrics.
+        LossOutput
+            An object containing the computed losses and metrics.
         """
         # reconstruction loss X
         x = tensors[REGISTRY_KEYS.X_KEY]
@@ -1066,4 +1069,9 @@ class CellDISECTModule(BaseModuleClass):
             LOSS_KEYS.F1: f1
         }
 
-        return loss_dict
+        return LossOutput(
+            loss=loss,
+            reconstruction_loss=reconst_loss_x,
+            kl_local=kl_loss,
+            extra_metrics=loss_dict
+        )
