@@ -3,7 +3,7 @@ from typing import Optional
 from scvi import settings
 from scvi.data import AnnDataManager
 from scvi.dataloaders import DataSplitter, AnnDataLoader
-from scvi.model._utils import parse_use_gpu_arg
+import torch
 
 
 class AnnDataSplitter(DataSplitter):
@@ -24,9 +24,14 @@ class AnnDataSplitter(DataSplitter):
         self.test_idx = test_indices
 
     def setup(self, stage: Optional[str] = None):
-        accelerator, _, self.device = parse_use_gpu_arg(
-            self.use_gpu, return_device=True
-        )
+        # Handle device selection in a way compatible with newer scvi-tools
+        if self.use_gpu and torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            accelerator = "gpu"
+        else:
+            self.device = torch.device("cpu")
+            accelerator = "cpu"
+            
         self.pin_memory = (
             True
             if (settings.dl_pin_memory_gpu_training and accelerator == "gpu")

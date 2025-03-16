@@ -630,7 +630,8 @@ class CellDISECT(
     def train(
             self,
             max_epochs: Optional[int] = None,
-            use_gpu: Optional[Union[str, int, bool]] = True,
+            accelerator: str = "auto",
+            devices: Union[int, list[int], str] = "auto",
             train_size: float = 0.8,
             validation_size: Optional[float] = None,
             batch_size: int = 256,
@@ -646,6 +647,7 @@ class CellDISECT(
             n_cf: int = 10,  # number of X_cf recons (a random permutation of n VAEs and a random half-batch subset for each trial)
             kappa_optimizer2: bool = True,
             n_epochs_pretrain_ae: int = 0,
+            use_gpu: Optional[Union[str, int, bool]] = None,  # Kept for backwards compatibility
             **trainer_kwargs,
     ):
         """
@@ -655,8 +657,12 @@ class CellDISECT(
         ----------
         max_epochs : Optional[int]
             Number of passes through the dataset. If `None`, defaults to `np.min([round((20000 / n_cells) * 400), 400])`.
-        use_gpu : Optional[Union[str, int, bool]]
-            Whether to use GPU for training. Can be a boolean, string, or integer specifying the GPU device.
+        accelerator : str
+            Accelerator to use for training. One of 'cpu', 'gpu', 'tpu', 'ipu', 'auto'.
+            'auto' will use GPU if available, otherwise CPU.
+        devices : Union[int, list[int], str]
+            Devices to use for training. Can be an int (use that many devices), a list of ints
+            (use these specific devices), or a string ('auto' will use all available devices).
         train_size : float
             Size of the training set in the range [0.0, 1.0].
         validation_size : Optional[float]
@@ -687,6 +693,8 @@ class CellDISECT(
             Whether to use the second kappa optimizer.
         n_epochs_pretrain_ae : int
             Number of epochs to pretrain the autoencoder.
+        use_gpu : Optional[Union[str, int, bool]]
+            Deprecated. Use accelerator='gpu' and devices instead.
         **trainer_kwargs
             Other keyword arguments for :class:`~scvi.train.Trainer`.
 
@@ -699,6 +707,18 @@ class CellDISECT(
             max_epochs = int(np.min([round((20000 / n_cells) * 400), 400]))
 
         plan_kwargs = plan_kwargs if isinstance(plan_kwargs, dict) else {}
+        
+        # Handle deprecated use_gpu parameter for backward compatibility
+        if use_gpu is not None:
+            import warnings
+            warnings.warn(
+                "The use_gpu parameter is deprecated. Please use accelerator='gpu' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if use_gpu:
+                accelerator = "gpu"
+                devices = 1 if isinstance(use_gpu, bool) else use_gpu
 
         if self.split_key is not None:
             data_splitter = AnnDataSplitter(
@@ -707,7 +727,7 @@ class CellDISECT(
                 valid_indices=self.valid_indices,
                 test_indices=self.test_indices,
                 batch_size=batch_size,
-                use_gpu=use_gpu,
+                use_gpu=accelerator == "gpu",  # Convert back for backward compatibility
                 drop_last=3,
             )
         else:
@@ -750,7 +770,8 @@ class CellDISECT(
             training_plan=training_plan,
             data_splitter=data_splitter,
             max_epochs=max_epochs,
-            use_gpu=use_gpu,
+            accelerator=accelerator,
+            devices=devices,
             **trainer_kwargs,
         )
         return runner()
