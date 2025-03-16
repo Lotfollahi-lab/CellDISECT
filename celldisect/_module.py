@@ -1072,5 +1072,6 @@ class CellDISECTModule(BaseModuleClass):
             loss=loss,
             reconstruction_loss=reconst_loss_x,
             kl_local=kl_loss,
-            extra_metrics=loss_dict
+            extra_metrics=loss_dict,
+            n_obs_minibatch=batch_size,
         )
