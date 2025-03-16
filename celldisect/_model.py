@@ -728,7 +728,7 @@ class CellDISECT(
                 test_indices=self.test_indices,
                 batch_size=batch_size,
                 use_gpu=accelerator == "gpu",  # Convert back for backward compatibility
-                drop_last=3,
+                drop_last=True,
             )
         else:
             data_splitter = DataSplitter(
