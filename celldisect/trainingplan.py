@@ -7,7 +7,7 @@ from torch import nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from scvi.module import Classifier
-from scvi.module.base import BaseModuleClass
+from scvi.module.base import BaseModuleClass, LossOutput
 JaxOptimizerCreator = Callable[[], optax.GradientTransformation]
 TorchOptimizerCreator = Callable[[Iterable[torch.Tensor]], torch.optim.Optimizer]
 from scvi.train import TrainingPlan
@@ -68,7 +68,7 @@ class CellDISECTTrainingPlan(TrainingPlan):
     lr_threshold : Tunable[float], optional
         Threshold for measuring the new optimum. Default is 0.0.
     lr_scheduler_metric : Literal["loss_validation"], optional
-        Which metric to track for learning rate reduction. Default is "loss_validation".
+        Metric to monitor for learning rate reduction. Default is "loss_validation".
     lr_min : float, optional
         Minimum learning rate allowed. Default is 0.
     scale_adversarial_loss : Union[float, Literal["auto"]], optional
@@ -87,13 +87,14 @@ class CellDISECTTrainingPlan(TrainingPlan):
     def __init__(
         self,
         module: BaseModuleClass,
-        recon_weight: Tunable[Union[float, int]],
-        cf_weight: Tunable[Union[float, int]],
-        beta: Tunable[Union[float, int]],
-        clf_weight: Tunable[Union[float, int]],
-        adv_clf_weight: Tunable[Union[float, int]],
-        adv_period: Tunable[int],
-        n_cf: Tunable[int],
+        *,
+        recon_weight: Tunable[Union[float, int]] = 1.0,
+        cf_weight: Tunable[Union[float, int]] = 1.0,
+        beta: Tunable[Union[float, int]] = 1.0,
+        clf_weight: Tunable[Union[float, int]] = 1.0,
+        adv_clf_weight: Tunable[Union[float, int]] = 1.0,
+        adv_period: Tunable[int] = 10,
+        n_cf: Tunable[int] = 1,
         optimizer: Tunable[Literal["Adam", "AdamW", "Custom"]] = "Adam",
         optimizer_creator: Optional[TorchOptimizerCreator] = None,
         lr: Tunable[float] = 1e-3,
@@ -178,7 +179,7 @@ class CellDISECTTrainingPlan(TrainingPlan):
             `kl_weight` should not be passed here and is handled automatically.
         """
         super().__init__(
-            module=module,
+            module,
             optimizer=optimizer,
             optimizer_creator=optimizer_creator,
             lr=lr,
@@ -193,10 +194,11 @@ class CellDISECTTrainingPlan(TrainingPlan):
             lr_min=lr_min,
             **loss_kwargs,
         )
+
         self.adv_clf_weight = adv_clf_weight
         self.adv_period = adv_period
-        self.kappa_optimizer2 = kappa_optimizer2
         self.n_epochs_pretrain_ae = n_epochs_pretrain_ae
+        self.kappa_optimizer2 = kappa_optimizer2
 
         self.loss_kwargs.update({"recon_weight": recon_weight,
                                  "cf_weight": cf_weight,
@@ -240,67 +242,82 @@ class CellDISECTTrainingPlan(TrainingPlan):
         self.scale_adversarial_loss = scale_adversarial_loss
         self.automatic_optimization = False
 
-    @staticmethod
-    def _create_elbo_metric_components(mode: str, n_total: Optional[int] = None):
-        """Initialize metrics and the metric collection."""
-        metrics_list = [ElboMetric(met_name, mode, "obs") for met_name in LOSS_KEYS_LIST]
-        collection = OrderedDict([(metric.name, metric) for metric in metrics_list])
-        return metrics_list, collection
-
-    def initialize_train_metrics(self):
-        """Initialize train related metrics."""
-        self.elbo_metrics_list_train, self.train_metrics = \
-            self._create_elbo_metric_components(mode="train", n_total=self.n_obs_training)
-
-    def initialize_val_metrics(self):
-        """Initialize val related metrics."""
-        self.elbo_metrics_list_val, self.val_metrics = \
-            self._create_elbo_metric_components(mode="validation", n_total=self.n_obs_validation)
-
-    @torch.inference_mode()
-    def compute_and_log_metrics(
-            self,
-            loss_output: dict,
-            metrics: Dict[str, ElboMetric],
-            mode: str,
-    ):
+    def compute_and_log_metrics(self, loss_output, metrics, mode):
         """
         Computes and logs metrics.
 
-        This function updates the provided metrics dictionary with the values from the loss output
-        and logs them using the appropriate logging method.
-
         Parameters
         ----------
-        loss_output : dict
-            Dictionary containing the loss output from the scvi-tools module.
-        metrics : Dict[str, ElboMetric]
-            Dictionary of metrics to update.
+        loss_output : LossOutput
+            LossOutput object from scvi-tools module
+        metrics : dict[str, ElboMetric]
+            Dictionary of metrics to update
         mode : str
-            Postfix string to add to the metric name for extra metrics.
+            Postfix string to add to the metric name of extra metrics
         """
-        for met_name in loss_output:
-            metrics[f"{met_name}_{mode}"] = loss_output[met_name]
-            if isinstance(loss_output[met_name], dict):
-                # Add mode to loss_output[met_name]'s keys
-                keys = list(loss_output[met_name].keys())
-                for key in keys:
-                    loss_output[met_name][f"{key}_{mode}"] = loss_output[met_name][key]
-                    del loss_output[met_name][key]
-                self.log_dict(
-                    loss_output[met_name],
-                    on_step=False,
-                    on_epoch=True,
-                    prog_bar=True
-                )
-            else:
-                self.log(
-                    f"{met_name}_{mode}",
-                    loss_output[met_name],
-                    on_step=False,
-                    on_epoch=True,
-                    prog_bar=True
-                )
+        if isinstance(loss_output, LossOutput):
+            # Handle LossOutput object
+            loss = loss_output.loss
+            reconstruction_loss = loss_output.reconstruction_loss
+            kl_local = loss_output.kl_local
+            kl_global = loss_output.kl_global
+            n_obs_minibatch = loss_output.n_obs_minibatch
+            extra_metrics = loss_output.extra_metrics
+        else:
+            # Handle dictionary for backward compatibility
+            loss = loss_output.get(LOSS_KEYS.LOSS, None)
+            reconstruction_loss = loss_output.get(LOSS_KEYS.RECONST_LOSS_X, None)
+            kl_local = loss_output.get(LOSS_KEYS.KL_Z, None)
+            kl_global = None
+            n_obs_minibatch = 1
+            extra_metrics = loss_output
+
+        # Update metrics
+        for metric in metrics.values():
+            if metric.name == "elbo_train" or metric.name == "elbo_validation":
+                metric.update(loss)
+            elif metric.name == "reconstruction_loss_train" or metric.name == "reconstruction_loss_validation":
+                if isinstance(reconstruction_loss, dict):
+                    # If reconstruction_loss is a dictionary, use the sum of values
+                    metric.update(sum(reconstruction_loss.values()))
+                else:
+                    metric.update(reconstruction_loss)
+            elif metric.name == "kl_local_train" or metric.name == "kl_local_validation":
+                if isinstance(kl_local, dict):
+                    # If kl_local is a dictionary, use the sum of values
+                    metric.update(sum(kl_local.values()))
+                else:
+                    metric.update(kl_local)
+            elif metric.name == "kl_global_train" or metric.name == "kl_global_validation":
+                metric.update(kl_global)
+
+        # Log metrics
+        for metric_name, metric_value in metrics.items():
+            self.log(
+                metric_name,
+                metric_value,
+                on_step=False,
+                on_epoch=True,
+                batch_size=n_obs_minibatch,
+                sync_dist=self.use_sync_dist,
+            )
+
+        # Log extra metrics
+        if extra_metrics is not None:
+            for key, value in extra_metrics.items():
+                if key not in [LOSS_KEYS.LOSS, LOSS_KEYS.RECONST_LOSS_X, LOSS_KEYS.KL_Z]:
+                    if isinstance(value, torch.Tensor):
+                        if value.shape != torch.Size([]):
+                            continue  # Skip non-scalar tensors
+                        value = value.detach()
+                    self.log(
+                        f"{key}_{mode}",
+                        value,
+                        on_step=False,
+                        on_epoch=True,
+                        batch_size=n_obs_minibatch,
+                        sync_dist=self.use_sync_dist,
+                    )
 
     def adv_classifier_metrics(self, inference_outputs, detach_z=True):
         """
@@ -346,15 +363,7 @@ class CellDISECTTrainingPlan(TrainingPlan):
 
     def training_step(self, batch, batch_idx):
         """Training step for adversarial training."""
-
-        if "kl_weight" in self.loss_kwargs:
-            self.loss_kwargs.update({"kl_weight": self.kl_weight})
-        kappa = (
-            self.kl_weight
-            if self.scale_adversarial_loss == "auto"
-            else self.scale_adversarial_loss
-        )
-
+        # Get optimizers
         opts = self.optimizers()
         if not isinstance(opts, list):
             opt1 = opts
@@ -362,39 +371,93 @@ class CellDISECTTrainingPlan(TrainingPlan):
         else:
             opt1, opt2 = opts
 
+        # kl annealing
+        if "kl_weight" in self.loss_kwargs:
+            self.loss_kwargs.update({"kl_weight": self.kl_weight})
+        kappa = (
+            self.kl_weight
+            if self.scale_adversarial_loss == "auto"
+            else self.scale_adversarial_loss
+        )
+        
+        # Log kappa
+        self.log("kl_weight", kappa, on_step=False, on_epoch=True)
+
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
 
-        inference_outputs, _, losses = self.forward(
+        inference_outputs, _, scvi_loss = self.forward(
             batch, loss_kwargs=input_kwargs
         )
-        # Log kappa
-        self.log("kl_weight", kappa, on_step=False, on_epoch=True)
+
+        # Handle LossOutput or dict
+        if isinstance(scvi_loss, LossOutput):
+            loss = scvi_loss.loss
+            extra_metrics = scvi_loss.extra_metrics if scvi_loss.extra_metrics is not None else {}
+            # Extract reconstruction loss for pretraining
+            if LOSS_KEYS.RECONST_LOSS_X in extra_metrics:
+                recon_loss_dict = extra_metrics[LOSS_KEYS.RECONST_LOSS_X]
+                if isinstance(recon_loss_dict, dict):
+                    recon_loss = sum(recon_loss_dict.values()) / len(recon_loss_dict)
+                else:
+                    recon_loss = recon_loss_dict
+            else:
+                recon_loss = scvi_loss.reconstruction_loss
+        else:
+            # For backward compatibility with dict
+            loss = scvi_loss[LOSS_KEYS.LOSS]
+            extra_metrics = scvi_loss
+            # Extract reconstruction loss for pretraining
+            recon_loss_dict = scvi_loss[LOSS_KEYS.RECONST_LOSS_X]
+            if isinstance(recon_loss_dict, dict):
+                recon_loss = sum(recon_loss_dict.values()) / len(recon_loss_dict)
+            else:
+                recon_loss = recon_loss_dict
+
         # train normally
         if self.n_epochs_pretrain_ae > 0 and self.current_epoch < self.n_epochs_pretrain_ae:
             opt1.zero_grad()
-            loss = losses[LOSS_KEYS.RECONST_LOSS_X]
-            loss = sum(loss.values()) / len(loss)
-            
-            self.manual_backward(loss)
+            self.manual_backward(recon_loss)
             opt1.step()
 
             ce_loss_mean, accuracy, f1 = self.adv_classifier_metrics(inference_outputs, True)
 
-            losses.update({'adv_ce': ce_loss_mean, 'adv_acc': accuracy, 'adv_f1': f1})
+            # Update metrics with adversarial metrics
+            adv_metrics = {'adv_ce': ce_loss_mean, 'adv_acc': accuracy, 'adv_f1': f1}
+            
+            if isinstance(scvi_loss, LossOutput):
+                # Create a new LossOutput with updated extra_metrics
+                if extra_metrics is not None:
+                    extra_metrics.update(adv_metrics)
+                else:
+                    extra_metrics = adv_metrics
+                    
+                updated_loss = LossOutput(
+                    loss=recon_loss,  # Use recon_loss as the main loss during pretraining
+                    reconstruction_loss=scvi_loss.reconstruction_loss,
+                    kl_local=scvi_loss.kl_local,
+                    kl_global=scvi_loss.kl_global,
+                    extra_metrics=extra_metrics
+                )
+            else:
+                # Update the dictionary directly
+                scvi_loss.update(adv_metrics)
+                updated_loss = scvi_loss
 
-            self.compute_and_log_metrics(losses, self.train_metrics, "train")
-
-            return losses
+            self.compute_and_log_metrics(updated_loss, self.train_metrics, "train")
+            return updated_loss
         
+        # Adversarial training
         if (self.current_epoch % self.adv_period == 0):
-
-            loss = losses[LOSS_KEYS.LOSS]
-
             # fool classifier if doing adversarial training
             if kappa > 0:
                 ce_loss_mean, accuracy, f1 = self.adv_classifier_metrics(inference_outputs, False)
-                loss -= ce_loss_mean * kappa * self.adv_clf_weight
+                if isinstance(scvi_loss, LossOutput):
+                    # Adjust the loss for adversarial training
+                    loss = loss - ce_loss_mean * kappa * self.adv_clf_weight
+                else:
+                    # For backward compatibility
+                    loss = scvi_loss[LOSS_KEYS.LOSS] - ce_loss_mean * kappa * self.adv_clf_weight
 
             opt1.zero_grad()
             self.manual_backward(loss)
@@ -402,7 +465,6 @@ class CellDISECTTrainingPlan(TrainingPlan):
 
         # train adversarial classifier
         if opt2 is not None:
-
             ce_loss_mean, accuracy, f1 = self.adv_classifier_metrics(inference_outputs, True)
             if self.kappa_optimizer2:
                 ce_loss_mean *= kappa
@@ -410,30 +472,77 @@ class CellDISECTTrainingPlan(TrainingPlan):
             self.manual_backward(ce_loss_mean)
             opt2.step()
 
-        losses.update({'adv_ce': ce_loss_mean, 'adv_acc': accuracy, 'adv_f1': f1})
+        # Update metrics with adversarial metrics
+        adv_metrics = {'adv_ce': ce_loss_mean, 'adv_acc': accuracy, 'adv_f1': f1}
+        
+        if isinstance(scvi_loss, LossOutput):
+            # Create a new LossOutput with updated extra_metrics
+            if extra_metrics is not None:
+                extra_metrics.update(adv_metrics)
+            else:
+                extra_metrics = adv_metrics
+                
+            updated_loss = LossOutput(
+                loss=loss,  # Use the potentially modified loss
+                reconstruction_loss=scvi_loss.reconstruction_loss,
+                kl_local=scvi_loss.kl_local,
+                kl_global=scvi_loss.kl_global,
+                extra_metrics=extra_metrics
+            )
+        else:
+            # Update the dictionary directly
+            scvi_loss.update(adv_metrics)
+            # Update the loss value if it was modified
+            scvi_loss[LOSS_KEYS.LOSS] = loss
+            updated_loss = scvi_loss
 
-        self.compute_and_log_metrics(losses, self.train_metrics, "train")
+        self.compute_and_log_metrics(updated_loss, self.train_metrics, "train")
 
-        return losses
+        return updated_loss
 
     def validation_step(self, batch, batch_idx):
         """Validation step."""
-
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
 
-        inference_outputs, _, losses = self.forward(
+        inference_outputs, _, scvi_loss = self.forward(
             batch, loss_kwargs=input_kwargs
         )
 
         ce_loss_mean, accuracy, f1 = self.adv_classifier_metrics(inference_outputs, True)
 
-        losses.update({'adv_ce': ce_loss_mean, 'adv_acc': accuracy, 'adv_f1': f1})
+        # Handle LossOutput or dict
+        if isinstance(scvi_loss, LossOutput):
+            extra_metrics = scvi_loss.extra_metrics if scvi_loss.extra_metrics is not None else {}
+        else:
+            # For backward compatibility with dict
+            extra_metrics = scvi_loss
 
+        # Update metrics with adversarial metrics
+        adv_metrics = {'adv_ce': ce_loss_mean, 'adv_acc': accuracy, 'adv_f1': f1}
         
-        self.compute_and_log_metrics(losses, self.val_metrics, "validation")
+        if isinstance(scvi_loss, LossOutput):
+            # Create a new LossOutput with updated extra_metrics
+            if extra_metrics is not None:
+                extra_metrics.update(adv_metrics)
+            else:
+                extra_metrics = adv_metrics
+                
+            updated_loss = LossOutput(
+                loss=scvi_loss.loss,
+                reconstruction_loss=scvi_loss.reconstruction_loss,
+                kl_local=scvi_loss.kl_local,
+                kl_global=scvi_loss.kl_global,
+                extra_metrics=extra_metrics
+            )
+        else:
+            # Update the dictionary directly
+            scvi_loss.update(adv_metrics)
+            updated_loss = scvi_loss
+        
+        self.compute_and_log_metrics(updated_loss, self.val_metrics, "validation")
 
-        return losses
+        return updated_loss
 
     def on_train_epoch_end(self):
         """Update the learning rate via scheduler steps."""
@@ -500,3 +609,20 @@ class CellDISECTTrainingPlan(TrainingPlan):
             return opts, scheds
         else:
             return opts
+
+    @staticmethod
+    def _create_elbo_metric_components(mode: str, n_total: Optional[int] = None):
+        """Initialize metrics and the metric collection."""
+        metrics_list = [ElboMetric(met_name, mode, "obs") for met_name in LOSS_KEYS_LIST]
+        collection = OrderedDict([(metric.name, metric) for metric in metrics_list])
+        return metrics_list, collection
+
+    def initialize_train_metrics(self):
+        """Initialize train related metrics."""
+        self.elbo_metrics_list_train, self.train_metrics = \
+            self._create_elbo_metric_components(mode="train", n_total=self.n_obs_training)
+
+    def initialize_val_metrics(self):
+        """Initialize val related metrics."""
+        self.elbo_metrics_list_val, self.val_metrics = \
+            self._create_elbo_metric_components(mode="validation", n_total=self.n_obs_validation)
