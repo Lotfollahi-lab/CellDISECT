@@ -4,7 +4,7 @@ from typing import Callable, Iterable, Literal, Optional, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.distributions import kl_divergence as kl
+from torch.distributions import kl_divergence as kl, Normal
 from torchmetrics import Accuracy, F1Score
 
 from scvi import REGISTRY_KEYS
@@ -43,8 +43,8 @@ class CellDISECTModule(BaseModuleClass):
         Dropout rate for neural networks, by default 0.1.
     log_variational : bool, optional
         Log(data+1) prior to encoding for numerical stability. Not normalization, by default True.
-    gene_likelihood : Tunable[Literal["zinb", "nb", "poisson"]], optional
-        One of 'nb' (Negative binomial distribution), 'zinb' (Zero-inflated negative binomial distribution), or 'poisson' (Poisson distribution), by default "zinb".
+    gene_likelihood : Tunable[Literal["zinb", "nb", "poisson", "normal"]], optional
+        One of 'nb' (Negative binomial distribution), 'zinb' (Zero-inflated negative binomial distribution), 'poisson' (Poisson distribution), or 'normal' (Normal distribution), by default "zinb".
     latent_distribution : Tunable[Literal["normal", "ln"]], optional
         One of 'normal' (Isotropic normal) or 'ln' (Logistic normal with normal params N(0, 1)), by default "normal".
     deeply_inject_covariates : Tunable[bool], optional
@@ -73,7 +73,7 @@ class CellDISECTModule(BaseModuleClass):
             n_cats_per_cov: Optional[Iterable[int]] = None,
             dropout_rate: Tunable[float] = 0.1,
             log_variational: bool = True,
-            gene_likelihood: Tunable[Literal["zinb", "nb", "poisson"]] = "zinb",
+            gene_likelihood: Tunable[Literal["zinb", "nb", "poisson", "normal"]] = "zinb",
             latent_distribution: Tunable[Literal["normal", "ln"]] = "normal",
             deeply_inject_covariates: Tunable[bool] = True,
             use_batch_norm: Tunable[Literal["encoder", "decoder", "none", "both"]] = "both",
@@ -238,6 +238,129 @@ class CellDISECTModule(BaseModuleClass):
                 ).to(device)
             )
 
+    def _validate_gene_likelihood_data_compatibility(self, x: torch.Tensor):
+        """
+        Validate that the gene likelihood is compatible with the input data.
+        
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input gene expression data
+            
+        Raises
+        ------
+        ValueError
+            If there's a mismatch between gene likelihood and data type
+        """
+        if self.gene_likelihood in ["zinb", "nb", "poisson"]:
+            if torch.any(x < 0):
+                raise ValueError(
+                    f"Gene likelihood '{self.gene_likelihood}' requires non-negative data, "
+                    f"but found negative values. Consider using 'normal' for log-normalized or "
+                    f"continuous data."
+                )
+            if torch.any(x != torch.floor(x)) and self.gene_likelihood != "poisson":
+                # Allow non-integer for poisson as it can handle continuous rate parameters
+                import warnings
+                warnings.warn(
+                    f"Gene likelihood '{self.gene_likelihood}' typically expects count data "
+                    f"(integers), but found non-integer values. This might indicate "
+                    f"log-normalized data - consider using 'normal' distribution.",
+                    UserWarning
+                )
+        elif self.gene_likelihood == "normal":
+            if torch.all(x >= 0) and torch.all(x == torch.floor(x)):
+                import warnings
+                warnings.warn(
+                    f"Gene likelihood 'normal' is used with what appears to be count data "
+                    f"(non-negative integers). Consider using 'zinb', 'nb', or 'poisson' "
+                    f"for count data.",
+                    UserWarning
+                )
+
+    def _compute_library_size(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute library size based on gene likelihood type.
+        
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input gene expression data
+            
+        Returns
+        -------
+        torch.Tensor
+            Library size tensor
+        """
+        if self.gene_likelihood in ["zinb", "nb", "poisson"]:
+            # For count data, library size is log of total counts per cell
+            return torch.log(x.sum(1) + 1e-6).unsqueeze(1)  # Add small epsilon to avoid log(0)
+        else:
+            # For continuous data (normal), library size is not meaningful
+            # Return zeros with same shape
+            return torch.zeros(x.shape[0], 1, device=x.device)
+
+    def _preprocess_input(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Preprocess input based on gene likelihood and log_variational setting.
+        
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input gene expression data
+            
+        Returns
+        -------
+        torch.Tensor
+            Preprocessed input data
+        """
+        if self.log_variational and self.gene_likelihood in ["zinb", "nb", "poisson"]:
+            # Apply log(1+x) transformation only for count data
+            return torch.log(1 + x)
+        else:
+            # For normal distribution or when log_variational is False, return as-is
+            return x
+
+    def _create_distribution(self, px_scale: torch.Tensor, px_r: torch.Tensor, 
+                           px_rate: torch.Tensor, px_dropout: torch.Tensor) -> torch.distributions.Distribution:
+        """
+        Create the appropriate distribution based on gene_likelihood.
+        
+        Parameters
+        ----------
+        px_scale : torch.Tensor
+            Scale parameter
+        px_r : torch.Tensor  
+            Dispersion parameter (for count distributions)
+        px_rate : torch.Tensor
+            Rate/mean parameter
+        px_dropout : torch.Tensor
+            Dropout parameter (for zero-inflated distributions)
+            
+        Returns
+        -------
+        torch.distributions.Distribution
+            The appropriate distribution object
+        """
+        if self.gene_likelihood == "zinb":
+            return ZeroInflatedNegativeBinomial(
+                mu=px_rate,
+                theta=px_r,
+                zi_logits=px_dropout,
+                scale=px_scale,
+            )
+        elif self.gene_likelihood == "nb":
+            return NegativeBinomial(mu=px_rate, theta=px_r, scale=px_scale)
+        elif self.gene_likelihood == "poisson":
+            return Poisson(px_rate, scale=px_scale)
+        elif self.gene_likelihood == "normal":
+            # For normal distribution, use px_rate as mean and px_r as log std
+            # This follows scvi-tools conventions for continuous distributions
+            std = torch.exp(px_r)  # Ensure positive std
+            return Normal(px_rate, std)
+        else:
+            raise ValueError(f"Unsupported gene likelihood: {self.gene_likelihood}")
+
     def _get_inference_input(
             self,
             tensors: dict[str, torch.Tensor]
@@ -322,10 +445,12 @@ class CellDISECTModule(BaseModuleClass):
         """
         nullify_cat_covs_indices = [] if nullify_cat_covs_indices is None else nullify_cat_covs_indices
 
-        x_ = x
-        library = torch.log(x.sum(1)).unsqueeze(1)
-        if self.log_variational:
-            x_ = torch.log(1 + x_)
+        # Validate data compatibility with gene likelihood
+        self._validate_gene_likelihood_data_compatibility(x)
+        
+        # Compute library size and preprocess input using helper methods
+        library = self._compute_library_size(x)
+        x_ = self._preprocess_input(x)
 
         # cat_covs are shaped like (batch_size, n_cat_covs)
         # we split them into a list of n_cat_covs (batch_size, 1) tensors
@@ -466,18 +591,8 @@ class CellDISECTModule(BaseModuleClass):
             )
             px_r = torch.exp(self.px_r)
 
-            if self.gene_likelihood == "zinb":
-                px = ZeroInflatedNegativeBinomial(
-                    mu=px_rate,
-                    theta=px_r,
-                    zi_logits=px_dropout,
-                    scale=px_scale,
-                )
-            elif self.gene_likelihood == "nb":
-                px = NegativeBinomial(mu=px_rate, theta=px_r, scale=px_scale)
-            elif self.gene_likelihood == "poisson":
-                px = Poisson(px_rate, scale=px_scale)
-
+            # Use helper method to create distribution
+            px = self._create_distribution(px_scale, px_r, px_rate, px_dropout)
             output_dict["px"] += [px]
         return output_dict
 
@@ -510,9 +625,9 @@ class CellDISECTModule(BaseModuleClass):
         if detach_x:
             x_ = x.detach()
 
-        library = torch.log(x_.sum(1)).unsqueeze(1)
-        if self.log_variational:
-            x_ = torch.log(1 + x_)
+        # Use helper methods for consistent preprocessing
+        library = self._compute_library_size(x_)
+        x_ = self._preprocess_input(x_)
 
         cat_in = torch.split(cat_covs, 1, dim=1)
         
@@ -546,17 +661,8 @@ class CellDISECTModule(BaseModuleClass):
         )
         px_r = torch.exp(self.px_r)
 
-        if self.gene_likelihood == "zinb":
-            px = ZeroInflatedNegativeBinomial(
-                mu=px_rate,
-                theta=px_r,
-                zi_logits=px_dropout,
-                scale=px_scale,
-            )
-        elif self.gene_likelihood == "nb":
-            px = NegativeBinomial(mu=px_rate, theta=px_r, scale=px_scale)
-        elif self.gene_likelihood == "poisson":
-            px = Poisson(px_rate, scale=px_scale)
+        # Use helper method to create distribution
+        px = self._create_distribution(px_scale, px_r, px_rate, px_dropout)
         return px
 
     def classification_logits(self, inference_outputs):
@@ -618,9 +724,9 @@ class CellDISECTModule(BaseModuleClass):
         if detach_x:
             x_ = x.detach()
 
-        library = torch.log(x_.sum(1)).unsqueeze(1)
-        if self.log_variational:
-            x_ = torch.log(1 + x_)
+        # Use helper methods for consistent preprocessing
+        library = self._compute_library_size(x_)
+        x_ = self._preprocess_input(x_)
 
         emb = []
         for i, embedding in enumerate(cat_covs.t()):
@@ -683,17 +789,8 @@ class CellDISECTModule(BaseModuleClass):
             # there won't be any output from the decoder idx
             return None
 
-        if self.gene_likelihood == "zinb":
-            px = ZeroInflatedNegativeBinomial(
-                mu=px_rate,
-                theta=px_r,
-                zi_logits=px_dropout,
-                scale=px_scale,
-            )
-        elif self.gene_likelihood == "nb":
-            px = NegativeBinomial(mu=px_rate, theta=px_r, scale=px_scale)
-        elif self.gene_likelihood == "poisson":
-            px = Poisson(px_rate, scale=px_scale)
+        # Use helper method to create distribution
+        px = self._create_distribution(px_scale, px_r, px_rate, px_dropout)
         return px
 
 
@@ -728,9 +825,9 @@ class CellDISECTModule(BaseModuleClass):
         if detach_x:
             x_ = x.detach()
 
-        library = torch.log(x_.sum(1)).unsqueeze(1)
-        if self.log_variational:
-            x_ = torch.log(1 + x_)
+        # Use helper methods for consistent preprocessing
+        library = self._compute_library_size(x_)
+        x_ = self._preprocess_input(x_)
         
         emb = []
         for i, embedding in enumerate(cat_covs.t()):
@@ -780,19 +877,9 @@ class CellDISECTModule(BaseModuleClass):
         )
         px_r = torch.exp(self.px_r)
 
-        if self.gene_likelihood == "zinb":
-            px = ZeroInflatedNegativeBinomial(
-                mu=px_rate,
-                theta=px_r,
-                zi_logits=px_dropout,
-                scale=px_scale,
-            )
-        elif self.gene_likelihood == "nb":
-            px = NegativeBinomial(mu=px_rate, theta=px_r, scale=px_scale)
-        elif self.gene_likelihood == "poisson":
-            px = Poisson(px_rate, scale=px_scale)
+        # Use helper method to create distribution
+        px = self._create_distribution(px_scale, px_r, px_rate, px_dropout)
         return px
-
 
     def sub_forward_cf_avg(
             self,
@@ -846,7 +933,6 @@ class CellDISECTModule(BaseModuleClass):
         # predictions from all the encoder/decoders to get the final counterfactual gene expression
         x_avg = torch.mean(torch.cat(xs), dim=0)
         return x_avg, pxs
-
 
     def compute_clf_metrics(self, logits, cat_covs):
         """
@@ -955,7 +1041,10 @@ class CellDISECTModule(BaseModuleClass):
         # reconstruction loss X
         x = tensors[REGISTRY_KEYS.X_KEY]
 
-        reconst_loss_x_list = [-torch.mean(px.log_prob(x).mean(-1)) for px in generative_outputs["px"]]
+        if self.gene_likelihood == 'normal':
+            reconst_loss_x_list = [torch.mean((px.mean - x) ** 2) for px in generative_outputs["px"]]
+        else:
+            reconst_loss_x_list = [-torch.mean(px.log_prob(x).mean(-1)) for px in generative_outputs["px"]]
         reconst_loss_x_dict = {'x_' + str(i): reconst_loss_x_list[i] for i in range(len(reconst_loss_x_list))}
         reconst_loss_x = sum(reconst_loss_x_list) / len(reconst_loss_x_list)
 
@@ -1016,12 +1105,22 @@ class CellDISECTModule(BaseModuleClass):
                 # some dists in pxs might be None if all cells in the batch have their encoder decoder related covariate changed
                 # we only compare the cells in the batch for each enc/dec where the corresponding covariate has not been changed
                 # in enc/dec 0 however, since there is no problem with changing even all the covariates, we can use all the cells (that's why we added a column of all True to cf_difference)
-                log_probs = [px_.log_prob(x_cf[cf_difference[:, i]])
-                             for i, px_ in enumerate(pxs) if px_ is not None]
-                probs = [torch.exp(log_prob) for log_prob in log_probs]
-                mean_probs = torch.mean(torch.cat(probs), dim=0)
-                nll = -torch.log(mean_probs)
-                reconst_loss_x_cf_list.append(torch.mean(nll))
+                if self.gene_likelihood == 'normal':
+                    mse_losses = []
+                    for i, px_ in enumerate(pxs):
+                        if px_ is not None:
+                            x_cf_i = x_cf[cf_difference[:, i]]
+                            mse_loss = torch.mean((px_.mean - x_cf_i) ** 2)
+                            mse_losses.append(mse_loss)
+                    if mse_losses:
+                        reconst_loss_x_cf_list.append(torch.mean(torch.stack(mse_losses)))
+                else:
+                    log_probs = [px_.log_prob(x_cf[cf_difference[:, i]])
+                                 for i, px_ in enumerate(pxs) if px_ is not None]
+                    probs = [torch.exp(log_prob) for log_prob in log_probs]
+                    mean_probs = torch.mean(torch.cat(probs), dim=0)
+                    nll = -torch.log(mean_probs)
+                    reconst_loss_x_cf_list.append(torch.mean(nll))
                 
             else:
                 for idx in perm:

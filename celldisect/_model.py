@@ -68,6 +68,7 @@ class CellDISECT(
         * ``'nb'`` - Negative binomial distribution
         * ``'zinb'`` - Zero-inflated negative binomial distribution
         * ``'poisson'`` - Poisson distribution
+        * ``'normal'`` - Normal distribution
     latent_distribution
         One of:
 
@@ -100,7 +101,7 @@ class CellDISECT(
             n_latent_attribute: int = 10,
             n_layers: int = 1,
             dropout_rate: float = 0.1,
-            gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
+            gene_likelihood: Literal["zinb", "nb", "poisson", "normal"] = "zinb",
             latent_distribution: Literal["normal", "ln"] = "normal",
             split_key: str = None,
             train_split: Union[str, List[str]] = ["train"],
@@ -126,7 +127,7 @@ class CellDISECT(
             Number of hidden layers used for encoder and decoder neural networks, by default 1.
         dropout_rate : float, optional
             Dropout rate for neural networks, by default 0.1.
-        gene_likelihood : Literal["zinb", "nb", "poisson"], optional
+        gene_likelihood : Literal["zinb", "nb", "poisson", "normal"], optional
             Gene likelihood distribution, by default "zinb".
         latent_distribution : Literal["normal", "ln"], optional
             Latent distribution, by default "normal".
@@ -255,7 +256,8 @@ class CellDISECT(
         if add_cluster_covariate:
             cls.add_cluster_covariate(
                 adata,
-                normalize_counts=clustering_normalize_counts
+                normalize_counts=clustering_normalize_counts,
+                layer=layer if layer is not None else ('counts' if 'counts' in adata.layers else None)
                 )
 
         anndata_fields = [
@@ -287,7 +289,8 @@ class CellDISECT(
     def add_cluster_covariate(
         cls,
         adata: AnnData,
-        normalize_counts: bool = True):
+        normalize_counts: bool = True,
+        layer: Optional[str] = None):
         """
         Run PCA on the gene expression matrix and run Leiden clustering on the PCA components
         to create a cluster covariate to be added to the `adata.obs`.
@@ -297,7 +300,10 @@ class CellDISECT(
         adata : AnnData
             AnnData object containing the single-cell RNA sequencing data.
         normalize_counts : bool, optional
-            If True, takes the counts from the `adata.layers['counts']` and log normalizes them, by default True.
+            If True and layer is provided, normalize the data from the specified layer, by default True.
+            If True and layer is None, normalize data from adata.X (assumed to be appropriate for normalization).
+        layer : Optional[str], optional
+            Layer containing count data for normalization. If None, uses adata.X directly, by default None.
 
         Returns
         -------
@@ -309,18 +315,55 @@ class CellDISECT(
                 "Cluster covariate already present in adata.obs, remove in case you want to re-run, skipping!")
             return
 
-        if normalize_counts:
-            logger.info("Normalizing counts")
-            adata.X = adata.layers['counts'].copy()
-            # Normalizing to median total counts
-            sc.pp.normalize_total(adata)
-            # Logarithmize the data
-            sc.pp.log1p(adata)
+        # Store original X for restoration
+        original_X = adata.X.copy()
+        
+        try:
+            if normalize_counts:
+                if layer is not None:
+                    if layer not in adata.layers:
+                        raise ValueError(f"Layer '{layer}' not found in adata.layers. Available layers: {list(adata.layers.keys())}")
+                    logger.info(f"Normalizing data from layer '{layer}'")
+                    adata.X = adata.layers[layer].copy()
+                else:
+                    logger.info("Using data from adata.X for normalization")
+                
+                # Check if data appears to be counts (non-negative, mostly integers)
+                if hasattr(adata.X, 'toarray'):  # sparse matrix
+                    # Convert sparse matrix to dense for sampling
+                    dense_sample = adata.X.toarray().flatten()
+                    data_sample = dense_sample[:1000] if len(dense_sample) > 1000 else dense_sample
+                else:  # dense matrix
+                    data_sample = np.array(adata.X).flatten()
+                    data_sample = data_sample[:1000] if len(data_sample) > 1000 else data_sample
+                
+                try:
+                    is_count_like = (
+                        np.all(data_sample >= 0) and 
+                        np.allclose(data_sample, np.floor(data_sample))
+                    )
+                except Exception:
+                    # If data type checking fails, assume it's not count data
+                    is_count_like = False
+                
+                if is_count_like:
+                    # Data appears to be counts, apply standard normalization
+                    sc.pp.normalize_total(adata)
+                    sc.pp.log1p(adata)
+                else:
+                    # Data doesn't appear to be counts, skip normalization
+                    logger.info("Data doesn't appear to be count data, skipping normalization")
+            else:
+                logger.info("Skipping normalization as normalize_counts=False")
 
-        logger.info("Running PCA and Leiden clustering")
-        sc.tl.pca(adata, random_state=0)
-        sc.pp.neighbors(adata, use_rep='X_pca', random_state=0)
-        sc.tl.leiden(adata, key_added='_cluster', flavor='igraph', n_iterations=2, random_state=0)
+            logger.info("Running PCA and Leiden clustering")
+            sc.tl.pca(adata, random_state=0)
+            sc.pp.neighbors(adata, use_rep='X_pca', random_state=0)
+            sc.tl.leiden(adata, key_added='_cluster', flavor='igraph', n_iterations=2, random_state=0)
+            
+        finally:
+            # Always restore original X
+            adata.X = original_X
 
         return
         
@@ -343,11 +386,34 @@ class CellDISECT(
         cov_name = cats[cov_idx]
         adata_cf.obs[cov_name] = pd.Categorical([cov_value_cf for _ in adata_cf.obs[cov_name]])
 
+        # Get the original layer configuration from the model's setup
+        from scvi.data._constants import _SETUP_ARGS_KEY
+        original_setup_args = self.adata_manager.registry.get('setup_args', {})
+        original_layer = original_setup_args.get('layer', None)
+        original_categorical_covariate_keys = original_setup_args.get('categorical_covariate_keys', [])
+        original_continuous_covariate_keys = original_setup_args.get('continuous_covariate_keys', [])
+        original_batch_key = original_setup_args.get('batch_key', None)
+        original_labels_key = original_setup_args.get('labels_key', None)
+        original_size_factor_key = original_setup_args.get('size_factor_key', None)
+        
+        # Make sure cats parameter matches the original categorical covariates
+        if set(cats) != set(original_categorical_covariate_keys or []):
+            logger.warning(f"Provided cats {cats} differs from original categorical_covariate_keys {original_categorical_covariate_keys}")
+            cats_to_use = list(set(cats) & set(original_categorical_covariate_keys or []))
+            if not cats_to_use:
+                cats_to_use = cats  # fallback to user-provided cats
+            logger.warning(f"Using cats: {cats_to_use}")
+        else:
+            cats_to_use = cats
+
         CellDISECT.setup_anndata(
             adata_cf,
-            layer='counts',
-            categorical_covariate_keys=cats,
-            continuous_covariate_keys=[]
+            layer=original_layer,
+            batch_key=original_batch_key,
+            labels_key=original_labels_key,
+            size_factor_key=original_size_factor_key,
+            categorical_covariate_keys=cats_to_use,
+            continuous_covariate_keys=original_continuous_covariate_keys or []
         )
 
         adata_cf = self._validate_anndata(adata_cf)
@@ -448,8 +514,12 @@ class CellDISECT(
                 n_samples_from_source=n_samples_from_source,
             )
         """
-        # Copy the counts layer to the main matrix
-        adata.X = adata.layers['counts'].copy()
+        # Get the original layer configuration from the model's setup
+        original_setup_args = self.adata_manager.registry.get('setup_args', {})
+        original_layer = original_setup_args.get('layer', None)
+        
+        logger.info(f"Using layer configuration from model setup: layer='{original_layer}'")
+        
         adata.obs['idx'] = [i for i in range(len(adata))]
 
         # Identify true and source indices based on covariate values
@@ -482,12 +552,32 @@ class CellDISECT(
         batch_size = len(adata_cf)
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-        # Setup AnnData for the counterfactual data
+        # Setup AnnData for the counterfactual data using the same configuration as the original model
+        # Get all original setup arguments
+        original_categorical_covariate_keys = original_setup_args.get('categorical_covariate_keys', [])
+        original_continuous_covariate_keys = original_setup_args.get('continuous_covariate_keys', [])
+        original_batch_key = original_setup_args.get('batch_key', None)
+        original_labels_key = original_setup_args.get('labels_key', None)
+        original_size_factor_key = original_setup_args.get('size_factor_key', None)
+        
+        # Make sure cats parameter matches the original categorical covariates
+        if set(cats) != set(original_categorical_covariate_keys or []):
+            logger.warning(f"Provided cats {cats} differs from original categorical_covariate_keys {original_categorical_covariate_keys}")
+            # Use the intersection to be safe
+            cats_to_use = list(set(cats) & set(original_categorical_covariate_keys or []))
+            if not cats_to_use:
+                cats_to_use = cats  # fallback to user-provided cats
+            logger.warning(f"Using cats: {cats_to_use}")
+        else:
+            cats_to_use = cats
         self.setup_anndata(
             adata_cf,
-            layer='counts',
-            categorical_covariate_keys=cats,
-            continuous_covariate_keys=[]
+            layer=original_layer,
+            batch_key=original_batch_key,
+            labels_key=original_labels_key,
+            size_factor_key=original_size_factor_key,
+            categorical_covariate_keys=cats_to_use,
+            continuous_covariate_keys=original_continuous_covariate_keys or []
         )
         adata_cf = self._validate_anndata(adata_cf)
         source_adata = self._validate_anndata(source_adata)
@@ -512,7 +602,10 @@ class CellDISECT(
             for px_cf in pxs_cf:
                 if px_cf is None:
                     continue
-                x_cf = px_cf.mu
+                try:
+                    x_cf = px_cf.mu
+                except:
+                    x_cf = px_cf.mean
                 px_cf_mean_list.append(x_cf)
 
         # Compute mean predictions
