@@ -1,6 +1,6 @@
 import logging
 from typing import List, Literal, Optional, Sequence, Tuple, Union
-
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -756,3 +756,179 @@ class CellDISECT(
             **trainer_kwargs,
         )
         return runner()
+
+    @torch.no_grad()
+    def generate(
+        self,
+        n_samples: int,
+        covariates: dict[str, str],
+        library_size: Optional[float] = None,
+        adata_for_library_size: Optional[AnnData] = None,
+        random_seed: Optional[int] = None,
+        include_shared_latent: bool = False,
+    ):
+        """
+        Generate new cells conditionally based on specified categorical covariates.
+
+        This method generates `n_samples` new cells for a given combination of categorical covariates.
+        The generation process involves sampling from the latent spaces and then decoding to
+        get gene expression profiles.
+
+        The shared latent space (`z_shared`) is sampled from a standard normal distribution.
+        The attribute-specific latent spaces (`zs`) are sampled from their respective prior encoders,
+        conditioned on the provided covariates.
+
+        Parameters
+        ----------
+        n_samples
+            Number of cells to generate.
+        covariates
+            A dictionary mapping categorical covariate names to the desired values for generation.
+            All categorical covariates used to train the model must be specified.
+        library_size
+            A specific library size to use for generation.
+            Mutually exclusive with `adata_for_library_size`.
+        adata_for_library_size
+            An AnnData object to infer the median library size from. If cells with the specified
+            `covariates` combination exist in this AnnData object, their median library size is used.
+            Otherwise, the median library size of the entire `adata_for_library_size` is used.
+            Mutually exclusive with `library_size`.
+        random_seed
+            A random seed for reproducibility.
+        include_shared_latent
+            Whether to include the expression from the decoder associated with the shared latent space (Z_0)
+            in the `average_expression`. If `False`, the average is computed over attribute-specific
+            decoders only. We suggest setting this to `False` for most use cases. The shared decoder
+            is assumed to be `decoder_0`.
+
+        Returns
+        -------
+        A tuple containing:
+            - **average_expression** (numpy.ndarray): An array of shape `(n_samples, n_vars)`
+              representing the average gene expression across the selected decoders.
+            - **all_expressions** (dict[str, numpy.ndarray]): A dictionary where keys are
+              decoder names (`decoder_0`, `decoder_1`, etc.) and values are numpy arrays of
+              shape `(n_samples, n_vars)` representing the generated gene expression counts
+              from each individual decoder.
+
+        Examples
+        --------
+        >>> n_generated_cells = 10
+        >>> desired_covariates = {"cell_type": "T-cell", "condition": "diseased"}
+        >>> avg_expr, all_expr = model.generate(
+        ...     n_samples=n_generated_cells,
+        ...     covariates=desired_covariates,
+        ...     adata_for_library_size=adata
+        ... )
+
+        To compute a custom average using only a subset of decoders (e.g., decoder_0 and decoder_2):
+        >>> import numpy as np
+        >>> custom_avg = np.mean(
+        ...     [all_expr["decoder_0"], all_expr["decoder_2"]], axis=0
+        ... )
+        """
+        assert library_size is not None or adata_for_library_size is not None, "Either library_size or adata_for_library_size must be provided."
+        if adata_for_library_size is not None:
+            adata_for_library_size = adata_for_library_size.copy()
+        self._check_if_trained(warn=False)
+        self.module.eval()
+        if random_seed is not None:
+            random.seed(random_seed)
+            torch.manual_seed(random_seed)
+            np.random.seed(random_seed)
+
+        cat_covs_registry = self.adata_manager.get_state_registry(
+            REGISTRY_KEYS.CAT_COVS_KEY
+        )
+        cov_names = cat_covs_registry.field_keys
+        mappings = cat_covs_registry.mappings
+
+        if set(covariates.keys()) != set(cov_names):
+            raise ValueError(
+                "Please provide a value for every categorical covariate. "
+                f"Required: {cov_names}, but got: {list(covariates.keys())}"
+            )
+
+        cat_indices = []
+        for cov_name in cov_names:
+            cov_value = covariates[cov_name]
+            mapping = mappings[cov_name]
+            if cov_value not in mapping:
+                raise ValueError(
+                    f"Covariate value '{cov_value}' not found for covariate '{cov_name}'. "
+                    f"Available values are: {list(mapping)}"
+                )
+            value_idx = np.where(mapping == cov_value)[0][0]
+            cat_indices.append(value_idx)
+
+        cat_covs_tensor = (
+            torch.tensor(cat_indices, device=self.device).unsqueeze(0).expand(n_samples, -1)
+        )
+
+        # 1. Sample z_shared from a standard Gaussian
+        z_shared = torch.randn(
+            n_samples, self.module.n_latent_shared, device=self.device
+        )
+
+        # 2. Sample zs from prior encoders
+        prior_emb_in = []
+        for i, embedding_indices in enumerate(cat_covs_tensor.t()):
+            emb = self.module.covars_embeddings[str(i)](embedding_indices.long())
+            emb = emb + torch.randn_like(emb) * 0.1
+            prior_emb_in.append(emb)
+
+        zs = []
+        for i in range(len(self.module.z_prior_encoders_list)):
+            # Encoder returns (distribution, sample)
+            _, z_s_i = self.module.z_prior_encoders_list[i](prior_emb_in[i])
+            zs.append(z_s_i)
+
+        # 3. Decode
+        if library_size is not None:
+            library = torch.full(
+                (n_samples, 1), library_size
+            ).to(self.device)
+        elif adata_for_library_size is not None:
+            # If there are any cells for the covariate combination, use the library size of the subset, if not, use the library size of the entire dataset
+            cov_subset_mask = []
+            for cov_name, cov_value in covariates.items():
+                cov_subset_mask.append(adata_for_library_size.obs[cov_name] == cov_value)
+            cov_subset_mask = np.all(cov_subset_mask, axis=0)
+            if np.any(cov_subset_mask):
+                print(f"Using library size of the subset for the covariate combination {covariates}.")
+                print(f"Number of cells in the subset: {np.sum(cov_subset_mask)}")
+                adata_for_library_size = adata_for_library_size[cov_subset_mask]
+            else:
+                print(f"No cells found for the covariate combination {covariates} in the adata_for_library_size dataset.")
+                print(f"Using library size of the entire dataset.")
+                
+            library_global = torch.log(torch.tensor(adata_for_library_size.X.sum(1)).unsqueeze(1))
+            library_median = library_global.median().item()
+            print(f"Library size median: {library_median}")
+            library = torch.full(
+                (n_samples, 1), library_median
+            ).to(self.device)
+        else:
+            raise ValueError("Either library_size or adata_for_library_size must be provided.")
+            
+        generative_kwargs = {
+            "z_shared": z_shared,
+            "zs": zs,
+            "library": library,
+            "cat_covs": cat_covs_tensor,
+        }
+        generative_outputs = self.module.generative(**generative_kwargs)
+        pxs = generative_outputs["px"]
+
+        # 4. Return generated expressions from all decoders
+        all_expressions = {}
+        for i, px in enumerate(pxs):
+            all_expressions[f"decoder_{i}"] = px.mu.cpu().detach().numpy()
+
+        # 5. Compute average expression
+        if include_shared_latent:
+            average_expression = np.mean(list(all_expressions.values()), axis=0)
+        else:
+            average_expression = np.mean(list(all_expressions.values())[1:], axis=0)
+
+        return average_expression, all_expressions
