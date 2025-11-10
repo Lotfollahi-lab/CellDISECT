@@ -663,9 +663,13 @@ class CellDISECT(
         encoder_names = ["shared"] + [f"attribute_{i}" for i in range(self.module.zs_num)]
 
         for i, encoder in enumerate(self.module.z_encoders_list):
-            linear_layers = [
-                layer for layer in encoder.encoder.fc_layers if isinstance(layer, nn.Linear)
-            ]
+            sequences = [seq for seq in encoder.encoder.fc_layers]
+            linear_layers = []
+            for seq in sequences:
+                for layer in seq:
+                    if isinstance(layer, nn.Linear):
+                        linear_layers.append(layer)        
+
             
             # Add the mean encoder layer
             linear_layers.append(encoder.mean_encoder)
