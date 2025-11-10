@@ -35,6 +35,7 @@ from .data import AnnDataSplitter
 from .trainingplan import CellDISECTTrainingPlan
 
 from scvi.train._callbacks import SaveBestState
+import torch.nn as nn
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -107,6 +108,7 @@ class CellDISECT(
             valid_split: Union[str, List[str]] = ["valid"],
             test_split: Union[str, List[str]] = ["ood"],
             weighted_classifier=False,
+            use_bias: bool = True,
             **model_kwargs,
     ):
         """
@@ -140,6 +142,8 @@ class CellDISECT(
             Values in `split_key` to be used for testing, by default ["ood"].
         weighted_classifier : bool, optional
             Whether to use weighted classifiers for categorical covariates, by default False.
+        use_bias : bool, optional
+            Whether to use bias terms in the neural networks, by default True.
         **model_kwargs : dict
             Additional keyword arguments for the model.
         """
@@ -179,6 +183,7 @@ class CellDISECT(
             gene_likelihood=gene_likelihood,
             latent_distribution=latent_distribution,
             classifier_weights=self.classifier_weights,
+            bias=use_bias,
             **model_kwargs,
         )
         if split_key is not None:
@@ -628,6 +633,62 @@ class CellDISECT(
             covar_mappings[name] = mappings
 
         return covar_embeddings, covar_mappings
+
+    @torch.no_grad()
+    def get_gene_importance(self) -> pd.DataFrame:
+        """
+        Computes gene importance for each encoder.
+
+        This method calculates a gene importance score for each gene based on the weights
+        of the encoders. The importance is calculated by propagating the weights through
+        the network layers to obtain an effective weight matrix from input genes to the
+        latent space. This method is most accurate when the model is trained without biases
+        and with a non-negative activation function like ReLU. If biases are present,
+        they are ignored in this calculation.
+
+        Returns
+        -------
+        pd.DataFrame
+            A pandas DataFrame containing gene importance scores. The rows correspond to
+            genes, and the columns correspond to the different encoders (e.g., 'shared',
+            'attribute_0', 'attribute_1', ...).
+        """
+        self._check_if_trained(warn=False)
+        self.module.eval()
+
+        n_genes = self.summary_stats.n_vars
+        gene_names = self.adata_manager.adata.var_names.to_list()
+        importances_df = pd.DataFrame(index=gene_names)
+
+        encoder_names = ["shared"] + [f"attribute_{i}" for i in range(self.module.zs_num)]
+
+        for i, encoder in enumerate(self.module.z_encoders_list):
+            linear_layers = [
+                layer for layer in encoder.encoder.fc_layers if isinstance(layer, nn.Linear)
+            ]
+            
+            # Add the mean encoder layer
+            linear_layers.append(encoder.mean_encoder)
+
+            # Get weights and compute effective weight matrix
+            # Note: PyTorch Linear layer weights are (out_features, in_features)
+            # We transpose them to (in_features, out_features) for matrix multiplication
+            w1 = linear_layers[0].weight.t()
+            
+            # The input to the encoder is genes + covariates, we only want the gene part
+            w_eff = w1[:n_genes, :]
+
+            for layer in linear_layers[1:]:
+                w = layer.weight.t()
+                w_eff = torch.relu(w_eff) @ w
+            
+            # Calculate importance scores
+            gene_importances = torch.sum(torch.abs(w_eff), dim=1)
+            normalized_importances = gene_importances / torch.sum(gene_importances)
+            
+            importances_df[encoder_names[i]] = normalized_importances.cpu().numpy()
+
+        return importances_df
 
     def train(
             self,

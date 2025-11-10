@@ -61,6 +61,8 @@ class CellDISECTModule(BaseModuleClass):
         Custom embeddings to use if `use_custom_embs` is True, by default None.
     classifier_weights : Optional[list], optional
         Weights for the classifiers, by default None.
+    bias : bool, optional
+        Whether to use bias in the encoder and decoder layers, by default True.
     """
 
     def __init__(
@@ -82,6 +84,7 @@ class CellDISECTModule(BaseModuleClass):
             use_custom_embs: bool = False,
             embeddings: Union[torch.Tensor, List[torch.Tensor]] = None,
             classifier_weights: Optional[list] = None,
+            bias: bool = True,
     ):
         super().__init__()
         self.dispersion = "gene"
@@ -147,6 +150,7 @@ class CellDISECTModule(BaseModuleClass):
                     use_layer_norm=use_layer_norm_encoder,
                     var_activation=var_activation,
                     return_dist=True,
+                    bias=bias,
                 ).to(device)
             ]
         )
@@ -166,6 +170,7 @@ class CellDISECTModule(BaseModuleClass):
                     use_layer_norm=use_layer_norm_encoder,
                     var_activation=var_activation,
                     return_dist=True,
+                    bias=bias,
                 ).to(device)
                 for k in range(self.zs_num)
             ]
@@ -186,6 +191,7 @@ class CellDISECTModule(BaseModuleClass):
                     use_layer_norm=use_layer_norm_encoder,
                     var_activation=var_activation,
                     return_dist=True,
+                    bias=bias,
                 ).to(device)
                 for k in range(self.zs_num)
             ]
