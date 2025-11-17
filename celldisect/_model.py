@@ -7,7 +7,6 @@ import torch
 from anndata import AnnData
 import anndata as ad
 import scanpy as sc
-import random
 from scipy import sparse
 
 from sklearn.utils.class_weight import compute_class_weight
@@ -668,7 +667,7 @@ class CellDISECT(
             for seq in sequences:
                 for layer in seq:
                     if isinstance(layer, nn.Linear):
-                        linear_layers.append(layer)        
+                        linear_layers.append(layer)
 
             
             # Add the mean encoder layer
@@ -892,7 +891,8 @@ class CellDISECT(
         ...     [all_expr["decoder_0"], all_expr["decoder_2"]], axis=0
         ... )
         """
-        assert library_size is not None or adata_for_library_size is not None, "Either library_size or adata_for_library_size must be provided."
+        if library_size is None and adata_for_library_size is None:
+            raise ValueError("Either library_size or adata_for_library_size must be provided.")
         if adata_for_library_size is not None:
             adata_for_library_size = adata_for_library_size.copy()
         self._check_if_trained(warn=False)
