@@ -61,6 +61,8 @@ class CellDISECTModule(BaseModuleClass):
         Custom embeddings to use if `use_custom_embs` is True, by default None.
     classifier_weights : Optional[list], optional
         Weights for the classifiers, by default None.
+    bias : bool, optional
+        Whether to use bias in the encoder and decoder layers, by default True.
     """
 
     def __init__(
@@ -82,6 +84,7 @@ class CellDISECTModule(BaseModuleClass):
             use_custom_embs: bool = False,
             embeddings: Union[torch.Tensor, List[torch.Tensor]] = None,
             classifier_weights: Optional[list] = None,
+            bias: bool = True,
     ):
         super().__init__()
         self.dispersion = "gene"
@@ -147,6 +150,7 @@ class CellDISECTModule(BaseModuleClass):
                     use_layer_norm=use_layer_norm_encoder,
                     var_activation=var_activation,
                     return_dist=True,
+                    bias=bias,
                 ).to(device)
             ]
         )
@@ -166,6 +170,7 @@ class CellDISECTModule(BaseModuleClass):
                     use_layer_norm=use_layer_norm_encoder,
                     var_activation=var_activation,
                     return_dist=True,
+                    bias=bias,
                 ).to(device)
                 for k in range(self.zs_num)
             ]
@@ -186,6 +191,7 @@ class CellDISECTModule(BaseModuleClass):
                     use_layer_norm=use_layer_norm_encoder,
                     var_activation=var_activation,
                     return_dist=True,
+                    bias=bias,
                 ).to(device)
                 for k in range(self.zs_num)
             ]
@@ -646,6 +652,16 @@ class CellDISECTModule(BaseModuleClass):
             ith_emb = ith_emb.reshape(ith_emb.shape[0], -1)
         else:
             # Here's where the counterfactual decoding is happening
+
+            # If there is only one covariate, the attribute-specific decoder (decoder_i for i > 0)
+            # cannot be used for counterfactual predictions. This is because its latent space is
+            # conditioned on that single covariate, and the decoder input requires embeddings from
+            # all *other* covariates. When only one exists, there are no "other" covariates to condition on.
+            # By returning None, we ensure that for single-covariate counterfactuals, the model gracefully
+            # ignores this decoder and relies only on the shared decoder (decoder_0), which is the
+            # correct behavior.
+            if self.zs_num == 1:
+                return None
             ith_emb = []
             for i, embedding in enumerate(cat_covs_cf.t()):
                 if i == idx-1:
