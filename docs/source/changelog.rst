@@ -22,6 +22,14 @@ Beta Versions
 Stable Versions
 --------------
 
+0.1.5 (2025-11-23)
+^^^^^^^^^^^^^^^^^^^^
+
+* New Features:
+    * Added cell generation method to CellDISECT model for generating synthetic cells
+    * Added gene importance calculation with bias handling to identify key genes driving predictions
+    * Implemented handling for single covariate counterfactuals, ensuring correct decoder behavior when only one covariate is present
+
 0.1.1 (2024-03-11)
 ^^^^^^^^^^^^^^^^^^^^
 
