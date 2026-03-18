@@ -37,6 +37,21 @@ Beginner Tutorials
         +++
         :doc:`Open Notebook <CellDISECT_Counterfactual.ipynb>`
 
+Perturbation Prediction
+~~~~~~~~~~~~~~~~~~~~
+
+.. grid:: 2
+
+    .. grid-item-card:: 🧪 Perturbation Prediction
+        :link: CellDISECT_Perturbation.ipynb
+        :class-card: tutorial-card
+
+        Predict gene expression under seen, unseen, and combinatorial perturbations
+        using predefined gene embeddings (GenePT, ESM, scGPT).
+
+        +++
+        :doc:`Open Notebook <CellDISECT_Perturbation.ipynb>`
+
 Advanced Applications
 ~~~~~~~~~~~~~~~~~~
 
@@ -75,6 +90,7 @@ Detailed Tutorial Contents
     :numbered:
 
     CellDISECT_Counterfactual.ipynb
+    CellDISECT_Perturbation.ipynb
     Erythroid_subset_inference.ipynb
     Eraslan_CF_Tutorial.ipynb
 
@@ -91,6 +107,18 @@ In this introductory tutorial, you'll learn:
 * Visualizing and interpreting results
 
 :download:`Download Notebook <CellDISECT_Counterfactual.ipynb>`
+
+Perturbation Prediction Tutorial
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This tutorial covers:
+
+* Preparing predefined gene embeddings (GenePT, ESM) in ``adata.uns``
+* Setting up ``setup_anndata`` with ``perturbation_key`` and ``perturbation_embedding_key``
+* Training CellDISECT with perturbation-aware embeddings
+* Predicting seen, unseen, and combinatorial perturbations
+* Evaluating predictions with ``perturbation_metrics``
+
+:download:`Download Notebook <CellDISECT_Perturbation.ipynb>`
 
 Latent Space Analysis
 ~~~~~~~~~~~~~~~~~~~

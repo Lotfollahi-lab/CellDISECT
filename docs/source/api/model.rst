@@ -12,6 +12,15 @@ Model Class
 
    CellDISECT
 
+Perturbation Embedding
+-----------------------
+
+.. autosummary::
+   :toctree: generated
+   :template: class.rst
+
+   PerturbationEmbedding
+
 Module Components
 ------------------
 

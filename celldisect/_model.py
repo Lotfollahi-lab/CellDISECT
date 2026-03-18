@@ -29,9 +29,10 @@ from scvi.model.base import RNASeqMixin, VAEMixin, BaseModelClass
 from scvi.autotune._types import Tunable, TunableMixin
 logger = logging.getLogger(__name__)
 
-from ._module import CellDISECTModule
+from ._module import CellDISECTModule, PerturbationEmbedding
 from .data import AnnDataSplitter
 from .trainingplan import CellDISECTTrainingPlan
+from .utils import validate_perturbation_embeddings
 
 from scvi.train._callbacks import SaveBestState
 import torch.nn as nn
@@ -171,6 +172,26 @@ class CellDISECT(
                 classes = np.unique(y)
                 class_weight = compute_class_weight(class_weight="balanced", classes=classes, y=y)
                 self.classifier_weights.append(class_weight)
+        # Extract perturbation configuration if it was set during setup_anndata
+        pert_config = adata.uns.get('_celldisect_perturbation_config', None)
+        self._pert_config = pert_config
+        if pert_config is not None:
+            pert_cov_idx = pert_config['perturbation_cov_idx']
+            pert_emb_key = pert_config['perturbation_embedding_key']
+            predefined_embs = adata.uns[pert_emb_key]
+            cat_covs_registry = self.adata_manager.get_state_registry(
+                REGISTRY_KEYS.CAT_COVS_KEY
+            )
+            pert_category_names = list(
+                cat_covs_registry.mappings[pert_config['perturbation_key']]
+            )
+            delimiter = pert_config['perturbation_combination_delimiter']
+
+            model_kwargs['perturbation_cov_idx'] = pert_cov_idx
+            model_kwargs['predefined_pert_embeddings'] = predefined_embs
+            model_kwargs['perturbation_category_names'] = pert_category_names
+            model_kwargs['perturbation_combination_delimiter'] = delimiter
+
         self.module = self._module_cls(
             n_input=self.summary_stats.n_vars,
             n_cats_per_cov=n_cats_per_cov,
@@ -221,12 +242,20 @@ class CellDISECT(
             continuous_covariate_keys: Optional[List[str]] = None,
             add_cluster_covariate: bool = False,
             clustering_normalize_counts: bool = True,
+            perturbation_key: Optional[str] = None,
+            perturbation_embedding_key: Optional[str] = None,
+            perturbation_combination_delimiter: str = "+",
             **kwargs,
     ):
         """
         Set up the AnnData object for the CellDISECT model.
 
-        This method configures the AnnData object by registering the necessary fields and optionally adding a cluster covariate.
+        This method configures the AnnData object by registering the necessary
+        fields and optionally adding a cluster covariate.  When
+        ``perturbation_key`` is provided, the corresponding column in
+        ``adata.obs`` is treated as a perturbation covariate whose embeddings
+        come from ``adata.uns[perturbation_embedding_key]`` rather than being
+        learned during training.
 
         Parameters
         ----------
@@ -248,6 +277,17 @@ class CellDISECT(
             Whether to add a cluster covariate to `adata.obs`, by default False.
         clustering_normalize_counts : bool, optional
             Whether to normalize counts before clustering, by default True.
+        perturbation_key : Optional[str], optional
+            Column in ``adata.obs`` that contains perturbation labels (e.g.
+            ``"GeneA"``, ``"GeneA+GeneB"``).  When set, the perturbation
+            covariate uses predefined embeddings instead of learned ones.
+        perturbation_embedding_key : Optional[str], optional
+            Key in ``adata.uns`` whose value is a ``dict[str, np.ndarray]``
+            mapping atomic perturbation names to their vector
+            representations (e.g. ESM or GenePT embeddings).  Required when
+            ``perturbation_key`` is set.
+        perturbation_combination_delimiter : str, optional
+            Delimiter for combinatorial perturbation labels, by default ``"+"``.
         **kwargs
             Additional keyword arguments.
 
@@ -255,6 +295,35 @@ class CellDISECT(
         -------
         None
         """
+        # Handle perturbation covariate
+        if perturbation_key is not None:
+            if perturbation_embedding_key is None:
+                raise ValueError(
+                    "When `perturbation_key` is set, `perturbation_embedding_key` "
+                    "must also be provided."
+                )
+            validate_perturbation_embeddings(
+                adata, perturbation_key, perturbation_embedding_key,
+                perturbation_combination_delimiter,
+            )
+            if categorical_covariate_keys is None:
+                categorical_covariate_keys = []
+            if perturbation_key not in categorical_covariate_keys:
+                categorical_covariate_keys = list(categorical_covariate_keys)
+                categorical_covariate_keys.append(perturbation_key)
+                logger.info(
+                    f"Auto-added perturbation_key '{perturbation_key}' to "
+                    f"categorical_covariate_keys."
+                )
+
+            pert_cov_idx = categorical_covariate_keys.index(perturbation_key)
+            adata.uns['_celldisect_perturbation_config'] = {
+                'perturbation_key': perturbation_key,
+                'perturbation_embedding_key': perturbation_embedding_key,
+                'perturbation_combination_delimiter': perturbation_combination_delimiter,
+                'perturbation_cov_idx': pert_cov_idx,
+            }
+
         setup_method_args = cls._get_setup_method_args(**locals())
         if add_cluster_covariate:
             cls.add_cluster_covariate(
@@ -997,3 +1066,286 @@ class CellDISECT(
             average_expression = np.mean(list(all_expressions.values())[1:], axis=0)
 
         return average_expression, all_expressions
+
+    # ------------------------------------------------------------------
+    # Perturbation prediction API
+    # ------------------------------------------------------------------
+
+    def add_perturbation_embedding(
+        self,
+        name: str,
+        embedding: np.ndarray,
+    ) -> None:
+        """Register an embedding vector for an unseen atomic perturbation.
+
+        After calling this method the model can predict counterfactuals for
+        the new perturbation (or combinatorial perturbations that include it).
+
+        Parameters
+        ----------
+        name
+            Atomic perturbation name (e.g. ``"GeneC"``).
+        embedding
+            Vector representation with the same dimensionality as the
+            predefined embeddings used during training.
+        """
+        if self._pert_config is None:
+            raise RuntimeError(
+                "This model was not set up with perturbation support. "
+                "Use perturbation_key in setup_anndata first."
+            )
+        pert_idx = self._pert_config['perturbation_cov_idx']
+        pert_emb_module = self.module.covars_embeddings[str(pert_idx)]
+        if not isinstance(pert_emb_module, PerturbationEmbedding):
+            raise RuntimeError("Perturbation embedding module not found.")
+        pert_emb_module.add_perturbation(name, np.asarray(embedding, dtype=np.float32))
+
+    def get_perturbation_embeddings(self) -> Tuple[List[str], np.ndarray]:
+        """Return current perturbation names and their (combined) embeddings.
+
+        Returns
+        -------
+        names
+            Ordered list of perturbation category names.
+        embeddings
+            Numpy array of shape ``(n_perturbations, emb_dim)``.
+        """
+        if self._pert_config is None:
+            raise RuntimeError(
+                "This model was not set up with perturbation support."
+            )
+        pert_idx = self._pert_config['perturbation_cov_idx']
+        pert_emb_module = self.module.covars_embeddings[str(pert_idx)]
+        names = list(pert_emb_module._category_names)
+        weights = pert_emb_module.embedding.weight.data.cpu().numpy()
+        return names, weights
+
+    @torch.no_grad()
+    def predict_perturbation(
+        self,
+        adata: AnnData,
+        perturbation: str,
+        source_perturbation: str,
+        cats: List[str],
+        perturbation_key: str,
+        new_embeddings: Optional[dict] = None,
+        n_samples_from_source: Optional[int] = None,
+        seed: Optional[int] = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        """Predict gene expression after a (possibly unseen) perturbation.
+
+        This is the main entry-point for perturbation prediction.  It builds
+        on the counterfactual prediction machinery but additionally handles:
+
+        * **Unseen perturbations** -- provide their embeddings via
+          ``new_embeddings``.
+        * **Combinatorial perturbations** -- e.g. ``"GeneA+GeneB"`` is
+          resolved by summing atomic component embeddings.
+
+        Parameters
+        ----------
+        adata
+            AnnData object containing **all** cells (both source and target
+            perturbation groups).  Must have a ``'counts'`` layer.
+        perturbation
+            Target perturbation label (e.g. ``"GeneA"`` or ``"GeneA+GeneB"``).
+        source_perturbation
+            Source / control perturbation label (e.g. ``"ctrl"``).
+        cats
+            List of categorical covariate keys (same order used during
+            training).
+        perturbation_key
+            Which element of ``cats`` is the perturbation covariate.
+        new_embeddings
+            Optional dictionary mapping *atomic* perturbation names to their
+            embedding vectors.  Required when ``perturbation`` (or any of its
+            combinatorial components) was not seen during training.
+        n_samples_from_source
+            If set, randomly sample this many cells from the source group.
+        seed
+            Random seed for reproducibility.
+
+        Returns
+        -------
+        x_ctrl
+            Source (control) counts, shape ``(n_source, n_genes)``.
+        x_true
+            Target (ground-truth) counts if target cells exist in ``adata``,
+            otherwise ``None``.  Shape ``(n_target, n_genes)``.
+        x_pred
+            Predicted counts after perturbation, shape
+            ``(n_source, n_genes)``.
+
+        Examples
+        --------
+        >>> x_ctrl, x_true, x_pred = model.predict_perturbation(
+        ...     adata,
+        ...     perturbation="GeneX",
+        ...     source_perturbation="ctrl",
+        ...     cats=["cell_type", "perturbation"],
+        ...     perturbation_key="perturbation",
+        ...     new_embeddings={"GeneX": genept_embeddings["GeneX"]},
+        ... )
+        """
+        from .utils import parse_perturbation
+
+        self._check_if_trained(warn=False)
+
+        if self._pert_config is None:
+            raise RuntimeError(
+                "This model was not set up with perturbation support."
+            )
+
+        pert_idx = self._pert_config['perturbation_cov_idx']
+        pert_emb_module = self.module.covars_embeddings[str(pert_idx)]
+        delimiter = self._pert_config['perturbation_combination_delimiter']
+
+        # Register unseen atomic perturbation embeddings
+        if new_embeddings is not None:
+            for name, vec in new_embeddings.items():
+                if name not in pert_emb_module._predefined_embeddings:
+                    pert_emb_module._predefined_embeddings[name] = np.asarray(
+                        vec, dtype=np.float32
+                    )
+
+        # Ensure the target perturbation (and components) are in the table
+        components = parse_perturbation(perturbation, delimiter)
+        for comp in components:
+            if comp not in pert_emb_module._predefined_embeddings:
+                raise ValueError(
+                    f"Atomic perturbation '{comp}' has no embedding. "
+                    f"Provide it via new_embeddings."
+                )
+
+        # Also make sure source perturbation is known
+        src_components = parse_perturbation(source_perturbation, delimiter)
+        for comp in src_components:
+            if comp not in pert_emb_module._predefined_embeddings:
+                raise ValueError(
+                    f"Source perturbation component '{comp}' has no embedding."
+                )
+
+        # Prepare data
+        adata = adata.copy()
+        adata.X = adata.layers['counts'].copy()
+        adata.obs['_idx'] = range(len(adata))
+
+        _device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        # Source cells
+        source_mask = adata.obs[perturbation_key] == source_perturbation
+        source_adata = adata[source_mask].copy()
+
+        if n_samples_from_source is not None and n_samples_from_source < len(source_adata):
+            random.seed(seed)
+            chosen = random.sample(range(len(source_adata)), n_samples_from_source)
+            source_adata = source_adata[chosen].copy()
+
+        # Target (ground-truth) cells -- may not exist for unseen perturbations
+        target_mask = adata.obs[perturbation_key] == perturbation
+        if target_mask.any():
+            true_adata = adata[target_mask].copy()
+        else:
+            true_adata = None
+
+        # Build counterfactual adata
+        adata_cf = source_adata.copy()
+        adata_cf.obs.loc[:, perturbation_key] = pd.Categorical(
+            [perturbation] * len(adata_cf)
+        )
+
+        # Ensure both source and target perturbation labels exist as categories
+        # so that setup_anndata produces a valid mapping.
+        all_pert_labels = set(adata.obs[perturbation_key].unique())
+        all_pert_labels.add(perturbation)
+        all_pert_labels.add(source_perturbation)
+
+        # Build a combined adata that has all perturbation labels so the
+        # categorical mapping is complete
+        combined_adata = ad.concat([source_adata, adata_cf])
+
+        # Build the mapping
+        pert_emb_key = self._pert_config['perturbation_embedding_key']
+        combined_adata.uns[pert_emb_key] = pert_emb_module._predefined_embeddings
+
+        self.setup_anndata(
+            combined_adata,
+            layer='counts',
+            categorical_covariate_keys=cats,
+            continuous_covariate_keys=[],
+            perturbation_key=perturbation_key,
+            perturbation_embedding_key=pert_emb_key,
+            perturbation_combination_delimiter=delimiter,
+        )
+
+        # Get the new mapping for the perturbation covariate
+        new_manager = self._get_most_recent_anndata_manager(combined_adata, required=True)
+        new_cat_registry = new_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
+        new_pert_mapping = list(new_cat_registry.mappings[perturbation_key])
+
+        # Temporarily rebuild the perturbation embedding for the new mapping
+        old_category_names = list(pert_emb_module._category_names)
+        pert_emb_module.rebuild_for_mapping(new_pert_mapping)
+
+        # Now setup both adatas with the combined mapping
+        self.setup_anndata(
+            adata_cf,
+            layer='counts',
+            categorical_covariate_keys=cats,
+            continuous_covariate_keys=[],
+            perturbation_key=perturbation_key,
+            perturbation_embedding_key=pert_emb_key,
+            perturbation_combination_delimiter=delimiter,
+        )
+
+        self.setup_anndata(
+            source_adata,
+            layer='counts',
+            categorical_covariate_keys=cats,
+            continuous_covariate_keys=[],
+            perturbation_key=perturbation_key,
+            perturbation_embedding_key=pert_emb_key,
+            perturbation_combination_delimiter=delimiter,
+        )
+
+        adata_cf = self._validate_anndata(adata_cf)
+        source_adata = self._validate_anndata(source_adata)
+
+        batch_size = len(adata_cf)
+        scdl_cf = self._make_data_loader(adata=adata_cf, batch_size=batch_size)
+        scdl = self._make_data_loader(adata=source_adata, batch_size=batch_size)
+
+        px_cf_mean_list = []
+        for tensors, tensors_cf in zip(scdl, scdl_cf):
+            _, pxs_cf = self.module.sub_forward_cf_avg(
+                x=tensors[REGISTRY_KEYS.X_KEY].to(_device),
+                cat_covs=tensors[REGISTRY_KEYS.CAT_COVS_KEY].to(_device),
+                cat_covs_cf=tensors_cf[REGISTRY_KEYS.CAT_COVS_KEY].to(_device),
+            )
+            for px_cf in pxs_cf:
+                if px_cf is None:
+                    continue
+                px_cf_mean_list.append(px_cf.mu)
+
+        # Restore original mapping
+        pert_emb_module.rebuild_for_mapping(old_category_names)
+
+        # Aggregate predictions
+        px_cf_mean_tensor = torch.stack(px_cf_mean_list, dim=0)
+        x_pred = torch.mean(px_cf_mean_tensor, dim=0).cpu()
+
+        # Control counts
+        if sparse.issparse(source_adata.X):
+            x_ctrl = torch.tensor(source_adata.X.toarray())
+        else:
+            x_ctrl = torch.tensor(np.asarray(source_adata.X))
+
+        # True target counts
+        x_true = None
+        if true_adata is not None:
+            if sparse.issparse(true_adata.X):
+                x_true = torch.tensor(true_adata.X.toarray())
+            else:
+                x_true = torch.tensor(np.asarray(true_adata.X))
+
+        return x_ctrl, x_true, x_pred

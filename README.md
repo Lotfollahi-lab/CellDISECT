@@ -92,12 +92,57 @@ pip install -U "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/
 |----------|-------------|-------|
 | **Basic Training** | Learn how to train CellDISECT and make counterfactual predictions using the Kang dataset | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Lotfollahi-Lab/CellDISECT/blob/main/docs/source/tutorials/CellDISECT_Counterfactual.ipynb) [![Documentation](https://img.shields.io/badge/docs-blue)](https://celldisect.readthedocs.io/en/latest/tutorials/CellDISECT_Counterfactual.html) |
 
+### Perturbation Prediction
+
+| Tutorial | Description | Links |
+|----------|-------------|-------|
+| **Perturbation Prediction** | Predict gene expression under seen, unseen, and combinatorial perturbations using predefined embeddings (GenePT, ESM) | [![Documentation](https://img.shields.io/badge/docs-blue)](https://celldisect.readthedocs.io/en/latest/tutorials/CellDISECT_Perturbation.html) |
+
 ### Advanced Applications
 
 | Tutorial | Description | Links |
 |----------|-------------|-------|
 | **Latent Space Analysis** | Explore combinations of CellDISECT latent spaces for erythroid subset inference | [![Documentation](https://img.shields.io/badge/docs-blue)](https://celldisect.readthedocs.io/en/latest/tutorials/Erythroid_subset_inference.html) |
 | **Double Counterfactual** | Advanced tutorial recreating Scenario 2 counterfactual on the Eraslan dataset | [![Documentation](https://img.shields.io/badge/docs-blue)](https://celldisect.readthedocs.io/en/latest/tutorials/Eraslan_CF_Tutorial.html) |
+
+## 🧪 Perturbation Prediction
+
+CellDISECT supports perturbation prediction using **predefined gene embeddings** (e.g. GenePT, ESM). This enables prediction for unseen perturbations and combinatorial perturbations.
+
+```python
+import numpy as np
+from celldisect import CellDISECT, perturbation_metrics
+
+# Store predefined embeddings in adata.uns
+adata.uns['pert_embeddings'] = gene_embeddings  # dict: gene_name -> np.ndarray
+
+# Setup with perturbation support
+CellDISECT.setup_anndata(
+    adata,
+    layer='counts',
+    categorical_covariate_keys=['cell_type', 'perturbation'],
+    perturbation_key='perturbation',
+    perturbation_embedding_key='pert_embeddings',
+)
+
+# Train the model
+model = CellDISECT(adata, n_latent_shared=32, n_latent_attribute=32)
+model.train(max_epochs=200)
+
+# Predict seen, unseen, or combinatorial perturbations
+x_ctrl, x_true, x_pred = model.predict_perturbation(
+    adata,
+    perturbation='GeneA+GeneB',
+    source_perturbation='ctrl',
+    cats=['cell_type', 'perturbation'],
+    perturbation_key='perturbation',
+)
+
+# Evaluate
+metrics = perturbation_metrics(x_pred.numpy(), x_true.numpy(), x_ctrl.numpy())
+```
+
+See the [perturbation prediction tutorial](https://celldisect.readthedocs.io/en/latest/tutorials/CellDISECT_Perturbation.html) for a full walkthrough.
 
 ## 🤝 Contributing
 
