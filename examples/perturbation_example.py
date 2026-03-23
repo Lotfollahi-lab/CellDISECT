@@ -5,6 +5,7 @@ This script demonstrates how to:
 2. Set up and train a CellDISECT model with perturbation support
 3. Predict expression for seen, unseen, and combinatorial perturbations
 4. Evaluate predictions with perturbation_metrics
+5. Batch predict multiple perturbations efficiently with predict_perturbations
 """
 
 import numpy as np
@@ -140,3 +141,38 @@ if x_true is not None:
     print(f"Combinatorial perturbation '{combo_pert}' metrics: {metrics}")
 else:
     print(f"Combinatorial perturbation '{combo_pert}' prediction shape: {x_pred.shape}")
+
+# ============================================================
+# 9. Batch predict MULTIPLE perturbations efficiently
+# ============================================================
+# When predicting many perturbations, use predict_perturbations (plural)
+# for significant speedup over calling predict_perturbation in a loop.
+
+perturbations_to_predict = ["GeneA", "GeneB", "GeneA+GeneB"]
+
+# For unseen perturbations, provide all embeddings upfront
+new_embs = {
+    "GeneY": gene_embeddings["GeneY"],
+    "GeneZ": gene_embeddings["GeneZ"],
+}
+
+# This is much faster than looping over predict_perturbation
+results = model.predict_perturbations(
+    adata,
+    perturbations=perturbations_to_predict,
+    source_perturbation="ctrl",
+    cats=cats,
+    perturbation_key=perturbation_key,
+    new_embeddings=new_embs,  # optional: for unseen perturbations
+    batch_size=256,
+)
+
+# Results is a dict: {perturbation_name: (x_ctrl, x_true, x_pred)}
+for pert, (x_ctrl, x_true, x_pred) in results.items():
+    if x_true is not None:
+        metrics = perturbation_metrics(
+            x_pred.numpy(), x_true.numpy(), x_ctrl.numpy()
+        )
+        print(f"Batch prediction '{pert}' metrics: {metrics}")
+    else:
+        print(f"Batch prediction '{pert}' shape: {x_pred.shape}")

@@ -111,10 +111,12 @@ class PerturbationEmbedding(nn.Module):
         combined = torch.stack(component_vecs).sum(dim=0).unsqueeze(0)
 
         old_weight = self.embedding.weight.data
-        new_weight = torch.cat([old_weight, combined.to(old_weight.device)], dim=0)
+        device = old_weight.device
+        new_weight = torch.cat([old_weight, combined.to(device)], dim=0)
         self.embedding = nn.Embedding(new_weight.shape[0], self.embedding_dim)
         self.embedding.weight.data.copy_(new_weight)
         self.embedding.weight.requires_grad = False
+        self.embedding = self.embedding.to(device)
 
         self._category_names.append(name)
         return len(self._category_names) - 1
@@ -124,9 +126,11 @@ class PerturbationEmbedding(nn.Module):
         emb_matrix = build_perturbation_embedding_matrix(
             new_category_names, self._predefined_embeddings, self.combination_delimiter
         )
+        device = self.embedding.weight.device
         self.embedding = nn.Embedding(emb_matrix.shape[0], self.embedding_dim)
-        self.embedding.weight.data.copy_(emb_matrix)
+        self.embedding.weight.data.copy_(emb_matrix.to(device))
         self.embedding.weight.requires_grad = False
+        self.embedding = self.embedding.to(device)
         self._category_names = list(new_category_names)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:

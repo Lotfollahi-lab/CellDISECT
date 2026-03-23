@@ -1121,6 +1121,267 @@ class CellDISECT(
         return names, weights
 
     @torch.no_grad()
+    def predict_perturbations(
+        self,
+        adata: AnnData,
+        perturbations: List[str],
+        source_perturbation: str,
+        cats: List[str],
+        perturbation_key: str,
+        new_embeddings: Optional[dict] = None,
+        n_samples_from_source: Optional[int] = None,
+        seed: Optional[int] = 0,
+        device: Optional[Union[str, torch.device]] = None,
+        batch_size: Optional[int] = None,
+        source_adata: Optional[AnnData] = None,
+    ) -> dict:
+        """Predict gene expression for multiple perturbations efficiently.
+
+        This is a batch version of :meth:`predict_perturbation` that processes
+        multiple perturbations while sharing data preparation, setup, and source
+        cell encoding. This provides significant speedup when predicting many
+        perturbations.
+
+        Parameters
+        ----------
+        adata
+            AnnData object containing cells (both source and target perturbation
+            groups). Must have a ``'counts'`` layer.
+        perturbations
+            List of target perturbation labels (e.g. ``["GeneA", "GeneB", "GeneA+GeneB"]``).
+        source_perturbation
+            Source / control perturbation label (e.g. ``"ctrl"``).
+        cats
+            List of categorical covariate keys (same order used during training).
+        perturbation_key
+            Which element of ``cats`` is the perturbation covariate.
+        new_embeddings
+            Optional dictionary mapping *atomic* perturbation names to their
+            embedding vectors. Required when any perturbation (or its
+            combinatorial components) was not seen during training.
+        n_samples_from_source
+            If set, randomly sample this many cells from the source group.
+        seed
+            Random seed for reproducibility.
+        device
+            Device to run prediction on. If ``None``, uses the model's device.
+        batch_size
+            Batch size for forward passes. If ``None``, processes all cells at once.
+        source_adata
+            Optional AnnData with control cells. Use when ``adata`` has no cells
+            with ``source_perturbation``.
+
+        Returns
+        -------
+        dict
+            Dictionary mapping each perturbation name to a tuple of
+            ``(x_ctrl, x_true, x_pred)`` where:
+
+            - **x_ctrl**: Source (control) counts, shape ``(n_source, n_genes)``
+            - **x_true**: Target counts if cells exist, else ``None``
+            - **x_pred**: Predicted counts, shape ``(n_source, n_genes)``
+
+        Examples
+        --------
+        >>> results = model.predict_perturbations(
+        ...     adata,
+        ...     perturbations=["GeneA", "GeneB", "GeneC"],
+        ...     source_perturbation="ctrl",
+        ...     cats=["cell_type", "perturbation"],
+        ...     perturbation_key="perturbation",
+        ...     new_embeddings={"GeneC": genept_embeddings["GeneC"]},
+        ... )
+        >>> for pert, (x_ctrl, x_true, x_pred) in results.items():
+        ...     print(f"{pert}: predicted shape = {x_pred.shape}")
+        """
+        from .utils import parse_perturbation
+
+        self._check_if_trained(warn=False)
+
+        if self._pert_config is None:
+            raise RuntimeError(
+                "This model was not set up with perturbation support."
+            )
+
+        if not perturbations:
+            return {}
+
+        pert_idx = self._pert_config['perturbation_cov_idx']
+        pert_emb_module = self.module.covars_embeddings[str(pert_idx)]
+        delimiter = self._pert_config['perturbation_combination_delimiter']
+
+        # Register all unseen atomic perturbation embeddings upfront
+        if new_embeddings is not None:
+            for name, vec in new_embeddings.items():
+                if name not in pert_emb_module._predefined_embeddings:
+                    pert_emb_module._predefined_embeddings[name] = np.asarray(
+                        vec, dtype=np.float32
+                    )
+
+        # Validate all perturbations have embeddings
+        all_components = set()
+        for pert in perturbations:
+            components = parse_perturbation(pert, delimiter)
+            all_components.update(components)
+
+        src_components = parse_perturbation(source_perturbation, delimiter)
+        all_components.update(src_components)
+
+        for comp in all_components:
+            if comp not in pert_emb_module._predefined_embeddings:
+                raise ValueError(
+                    f"Atomic perturbation '{comp}' has no embedding. "
+                    f"Provide it via new_embeddings."
+                )
+
+        # Prepare data once
+        adata = adata.copy()
+        adata.X = adata.layers['counts'].copy()
+        adata.obs['_idx'] = range(len(adata))
+
+        _device = device if device is not None else self.device
+        if isinstance(_device, str):
+            _device = torch.device(_device)
+
+        # Source cells: use source_adata if provided, else filter from adata
+        if source_adata is not None:
+            source_adata = source_adata.copy()
+            source_adata.X = source_adata.layers['counts'].copy()
+            source_mask = source_adata.obs[perturbation_key] == source_perturbation
+            source_adata = source_adata[source_mask].copy()
+        else:
+            source_mask = adata.obs[perturbation_key] == source_perturbation
+            source_adata = adata[source_mask].copy()
+
+        if len(source_adata) == 0:
+            raise ValueError(
+                f"No cells with {perturbation_key}='{source_perturbation}' found. "
+                f"Pass adata containing control cells or use `source_adata`."
+            )
+
+        if n_samples_from_source is not None and n_samples_from_source < len(source_adata):
+            random.seed(seed)
+            chosen = random.sample(range(len(source_adata)), n_samples_from_source)
+            source_adata = source_adata[chosen].copy()
+
+        # Collect all perturbation labels for combined mapping
+        all_pert_labels = set(adata.obs[perturbation_key].unique())
+        all_pert_labels.update(perturbations)
+        all_pert_labels.add(source_perturbation)
+
+        # Build a combined adata that includes source and one representative cf
+        # This ensures the categorical mapping includes all perturbations
+        adata_for_mapping = source_adata.copy()
+        adata_for_mapping.obs.loc[:, perturbation_key] = pd.Categorical(
+            [source_perturbation] * len(adata_for_mapping),
+            categories=list(all_pert_labels)
+        )
+
+        pert_emb_key = self._pert_config['perturbation_embedding_key']
+        adata_for_mapping.uns[pert_emb_key] = pert_emb_module._predefined_embeddings
+
+        self.setup_anndata(
+            adata_for_mapping,
+            layer='counts',
+            categorical_covariate_keys=cats,
+            continuous_covariate_keys=[],
+            perturbation_key=perturbation_key,
+            perturbation_embedding_key=pert_emb_key,
+            perturbation_combination_delimiter=delimiter,
+        )
+
+        new_manager = self._get_most_recent_anndata_manager(adata_for_mapping, required=True)
+        new_cat_registry = new_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
+        new_pert_mapping = list(new_cat_registry.mappings[perturbation_key])
+
+        # Rebuild perturbation embedding once for all perturbations
+        old_category_names = list(pert_emb_module._category_names)
+        pert_emb_module.rebuild_for_mapping(new_pert_mapping)
+
+        # Prepare source data loader
+        source_manager = new_manager.transfer_fields(source_adata)
+        _batch_size = batch_size if batch_size is not None else len(source_adata)
+        scdl_source = AnnDataLoader(source_manager, batch_size=_batch_size)
+
+        # Temporarily move model to target device
+        module_device = next(self.module.parameters()).device
+        if module_device != _device:
+            self.module.to(_device)
+
+        # Pre-extract source tensors for reuse
+        source_batches = []
+        for tensors in scdl_source:
+            source_batches.append({
+                'x': tensors[REGISTRY_KEYS.X_KEY].to(_device),
+                'cat_covs': tensors[REGISTRY_KEYS.CAT_COVS_KEY].to(_device),
+            })
+
+        # Get ground truth data for all perturbations
+        true_data = {}
+        for pert in perturbations:
+            target_mask = adata.obs[perturbation_key] == pert
+            if target_mask.any():
+                true_adata = adata[target_mask].copy()
+                if sparse.issparse(true_adata.X):
+                    true_data[pert] = torch.tensor(true_adata.X.toarray())
+                else:
+                    true_data[pert] = torch.tensor(np.asarray(true_adata.X))
+            else:
+                true_data[pert] = None
+
+        # Get source counts once
+        if sparse.issparse(source_adata.X):
+            x_ctrl = torch.tensor(source_adata.X.toarray())
+        else:
+            x_ctrl = torch.tensor(np.asarray(source_adata.X))
+
+        results = {}
+
+        try:
+            # Process each perturbation
+            for pert in perturbations:
+                # Build counterfactual cat_covs for this perturbation
+                pert_cf_idx = new_pert_mapping.index(pert)
+
+                px_cf_mean_list = []
+                for batch in source_batches:
+                    x = batch['x']
+                    cat_covs = batch['cat_covs']
+
+                    # Create counterfactual covariates
+                    cat_covs_cf = cat_covs.clone()
+                    cat_covs_cf[:, pert_idx] = pert_cf_idx
+
+                    _, pxs_cf = self.module.sub_forward_cf_avg(
+                        x=x,
+                        cat_covs=cat_covs,
+                        cat_covs_cf=cat_covs_cf,
+                    )
+
+                    batch_preds = []
+                    for px_cf in pxs_cf:
+                        if px_cf is None:
+                            continue
+                        batch_preds.append(px_cf.mu)
+
+                    if batch_preds:
+                        batch_mean = torch.stack(batch_preds, dim=0).mean(dim=0)
+                        px_cf_mean_list.append(batch_mean)
+
+                x_pred = torch.cat(px_cf_mean_list, dim=0).cpu()
+                x_true = true_data[pert]
+
+                results[pert] = (x_ctrl, x_true, x_pred)
+
+        finally:
+            # Restore original mapping and device
+            pert_emb_module.rebuild_for_mapping(old_category_names)
+            if module_device != _device:
+                self.module.to(module_device)
+
+        return results
+
+    @torch.no_grad()
     def predict_perturbation(
         self,
         adata: AnnData,
@@ -1131,6 +1392,9 @@ class CellDISECT(
         new_embeddings: Optional[dict] = None,
         n_samples_from_source: Optional[int] = None,
         seed: Optional[int] = 0,
+        device: Optional[Union[str, torch.device]] = None,
+        batch_size: Optional[int] = None,
+        source_adata: Optional[AnnData] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """Predict gene expression after a (possibly unseen) perturbation.
 
@@ -1164,6 +1428,16 @@ class CellDISECT(
             If set, randomly sample this many cells from the source group.
         seed
             Random seed for reproducibility.
+        device
+            Device to run prediction on. If ``None``, uses the model's device.
+            Use ``'cpu'`` to avoid CUDA allocation errors (e.g. CUBLAS_STATUS_ALLOC_FAILED).
+        batch_size
+            Batch size for forward passes. If ``None``, processes all cells at once.
+            Use a smaller value (e.g. 128) to reduce GPU memory usage.
+        source_adata
+            Optional AnnData with control cells. Use when ``adata`` has no cells
+            with ``source_perturbation`` (e.g. holdout test set). Must have
+            ``'counts'`` layer and same ``cats`` columns as training.
 
         Returns
         -------
@@ -1185,6 +1459,19 @@ class CellDISECT(
         ...     cats=["cell_type", "perturbation"],
         ...     perturbation_key="perturbation",
         ...     new_embeddings={"GeneX": genept_embeddings["GeneX"]},
+        ...     device="cpu",  # Use CPU to avoid CUDA allocation errors
+        ...     batch_size=128,  # Reduce batch size for lower memory usage
+        ... )
+        >>>
+        >>> # For holdout test set (no ctrl cells), pass source_adata from training:
+        >>> x_ctrl, x_true, x_pred = model.predict_perturbation(
+        ...     adata_test,
+        ...     perturbation="GeneX",
+        ...     source_perturbation="ctrl",
+        ...     cats=cats,
+        ...     perturbation_key="perturbation",
+        ...     new_embeddings={"GeneX": emb},
+        ...     source_adata=adata_train,  # Control cells from training set
         ... )
         """
         from .utils import parse_perturbation
@@ -1230,11 +1517,27 @@ class CellDISECT(
         adata.X = adata.layers['counts'].copy()
         adata.obs['_idx'] = range(len(adata))
 
-        _device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        _device = device if device is not None else self.device
+        if isinstance(_device, str):
+            _device = torch.device(_device)
 
-        # Source cells
-        source_mask = adata.obs[perturbation_key] == source_perturbation
-        source_adata = adata[source_mask].copy()
+        # Source cells: use source_adata if provided, else filter from adata
+        if source_adata is not None:
+            source_adata = source_adata.copy()
+            source_adata.X = source_adata.layers['counts'].copy()
+            source_mask = source_adata.obs[perturbation_key] == source_perturbation
+            source_adata = source_adata[source_mask].copy()
+        else:
+            source_mask = adata.obs[perturbation_key] == source_perturbation
+            source_adata = adata[source_mask].copy()
+
+        if len(source_adata) == 0:
+            raise ValueError(
+                f"No cells with {perturbation_key}='{source_perturbation}' found. "
+                f"Pass adata that contains control cells, or use the `source_adata` "
+                f"parameter to provide control cells from a different AnnData (e.g. "
+                f"adata_train) when evaluating on a holdout test set."
+            )
 
         if n_samples_from_source is not None and n_samples_from_source < len(source_adata):
             random.seed(seed)
@@ -1287,52 +1590,45 @@ class CellDISECT(
         old_category_names = list(pert_emb_module._category_names)
         pert_emb_module.rebuild_for_mapping(new_pert_mapping)
 
-        # Now setup both adatas with the combined mapping
-        self.setup_anndata(
-            adata_cf,
-            layer='counts',
-            categorical_covariate_keys=cats,
-            continuous_covariate_keys=[],
-            perturbation_key=perturbation_key,
-            perturbation_embedding_key=pert_emb_key,
-            perturbation_combination_delimiter=delimiter,
-        )
+        # Use transfer_fields so both source and cf use the SAME categorical mapping
+        # (from combined_adata). This avoids IndexError when embedding indices from
+        # a different manager's mapping would be out of range.
+        source_manager = new_manager.transfer_fields(source_adata)
+        cf_manager = new_manager.transfer_fields(adata_cf)
 
-        self.setup_anndata(
-            source_adata,
-            layer='counts',
-            categorical_covariate_keys=cats,
-            continuous_covariate_keys=[],
-            perturbation_key=perturbation_key,
-            perturbation_embedding_key=pert_emb_key,
-            perturbation_combination_delimiter=delimiter,
-        )
+        _batch_size = batch_size if batch_size is not None else len(adata_cf)
+        scdl = AnnDataLoader(source_manager, batch_size=_batch_size)
+        scdl_cf = AnnDataLoader(cf_manager, batch_size=_batch_size)
 
-        adata_cf = self._validate_anndata(adata_cf)
-        source_adata = self._validate_anndata(source_adata)
-
-        batch_size = len(adata_cf)
-        scdl_cf = self._make_data_loader(adata=adata_cf, batch_size=batch_size)
-        scdl = self._make_data_loader(adata=source_adata, batch_size=batch_size)
+        # Temporarily move model to target device if different
+        module_device = next(self.module.parameters()).device
+        if module_device != _device:
+            self.module.to(_device)
 
         px_cf_mean_list = []
-        for tensors, tensors_cf in zip(scdl, scdl_cf):
-            _, pxs_cf = self.module.sub_forward_cf_avg(
-                x=tensors[REGISTRY_KEYS.X_KEY].to(_device),
-                cat_covs=tensors[REGISTRY_KEYS.CAT_COVS_KEY].to(_device),
-                cat_covs_cf=tensors_cf[REGISTRY_KEYS.CAT_COVS_KEY].to(_device),
-            )
-            for px_cf in pxs_cf:
-                if px_cf is None:
-                    continue
-                px_cf_mean_list.append(px_cf.mu)
+        try:
+            for tensors, tensors_cf in zip(scdl, scdl_cf):
+                _, pxs_cf = self.module.sub_forward_cf_avg(
+                    x=tensors[REGISTRY_KEYS.X_KEY].to(_device),
+                    cat_covs=tensors[REGISTRY_KEYS.CAT_COVS_KEY].to(_device),
+                    cat_covs_cf=tensors_cf[REGISTRY_KEYS.CAT_COVS_KEY].to(_device),
+                )
+                batch_preds = []
+                for px_cf in pxs_cf:
+                    if px_cf is None:
+                        continue
+                    batch_preds.append(px_cf.mu)
+                if batch_preds:
+                    batch_mean = torch.stack(batch_preds, dim=0).mean(dim=0)
+                    px_cf_mean_list.append(batch_mean)
+        finally:
+            # Restore original mapping and device
+            pert_emb_module.rebuild_for_mapping(old_category_names)
+            if module_device != _device:
+                self.module.to(module_device)
 
-        # Restore original mapping
-        pert_emb_module.rebuild_for_mapping(old_category_names)
-
-        # Aggregate predictions
-        px_cf_mean_tensor = torch.stack(px_cf_mean_list, dim=0)
-        x_pred = torch.mean(px_cf_mean_tensor, dim=0).cpu()
+        # Aggregate predictions: concatenate batch predictions
+        x_pred = torch.cat(px_cf_mean_list, dim=0).cpu()
 
         # Control counts
         if sparse.issparse(source_adata.X):
