@@ -1,6 +1,8 @@
+import logging
 import random
-from typing import Callable, Iterable, Literal, Optional, Union
+from typing import Callable, Dict, Iterable, Literal, Optional, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -17,8 +19,127 @@ torch.backends.cudnn.benchmark = True
 from .utils import *
 from scvi.module._classifier import Classifier
 
+_logger = logging.getLogger(__name__)
+
 dim_indices = 0
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+class PerturbationEmbedding(nn.Module):
+    """Embedding module backed by predefined external vectors (e.g. ESM, GenePT).
+
+    For combinatorial perturbations (e.g. ``"GeneA+GeneB"``), component
+    embeddings are summed.  The weight matrix is **frozen** by default.
+
+    Parameters
+    ----------
+    predefined_embeddings
+        Mapping from atomic perturbation name to its vector representation.
+    category_names
+        Ordered list of category names that mirrors the integer-index mapping
+        produced by scvi-tools' ``CategoricalJointObsField``.
+    combination_delimiter
+        String used to split combinatorial perturbation labels.
+    """
+
+    def __init__(
+        self,
+        predefined_embeddings: Dict[str, np.ndarray],
+        category_names: list,
+        combination_delimiter: str = "+",
+    ):
+        super().__init__()
+        self.combination_delimiter = combination_delimiter
+        self._predefined_embeddings: Dict[str, np.ndarray] = dict(predefined_embeddings)
+        self._category_names: list = list(category_names)
+
+        emb_matrix = build_perturbation_embedding_matrix(
+            self._category_names, self._predefined_embeddings, combination_delimiter
+        )
+        self.embedding_dim = emb_matrix.shape[1]
+        self.embedding = nn.Embedding(
+            emb_matrix.shape[0], self.embedding_dim
+        )
+        self.embedding.weight.data.copy_(emb_matrix)
+        self.embedding.weight.requires_grad = False
+
+    # ------------------------------------------------------------------
+    # Runtime expansion for unseen perturbations
+    # ------------------------------------------------------------------
+    def add_perturbation(
+        self,
+        name: str,
+        embedding: Optional[np.ndarray] = None,
+    ) -> int:
+        """Register a new perturbation (possibly unseen during training).
+
+        Parameters
+        ----------
+        name
+            Perturbation label. Can be combinatorial (``"A+B"``).
+        embedding
+            Vector for an *atomic* perturbation that is not yet in the
+            predefined dictionary.  Ignored for names already known.
+
+        Returns
+        -------
+        Integer index of the (new or existing) perturbation.
+        """
+        if name in self._category_names:
+            return self._category_names.index(name)
+
+        components = parse_perturbation(name, self.combination_delimiter)
+        for comp in components:
+            if comp not in self._predefined_embeddings:
+                if embedding is not None and len(components) == 1:
+                    self._predefined_embeddings[comp] = np.asarray(embedding, dtype=np.float32)
+                elif embedding is not None:
+                    raise ValueError(
+                        f"Cannot add atomic embedding via `embedding` arg when name "
+                        f"'{name}' is combinatorial. Add each component separately first."
+                    )
+                else:
+                    raise ValueError(
+                        f"Atomic perturbation '{comp}' (from '{name}') has no predefined "
+                        f"embedding. Provide it via the `embedding` argument."
+                    )
+
+        component_vecs = [
+            torch.as_tensor(np.asarray(self._predefined_embeddings[c], dtype=np.float32))
+            for c in components
+        ]
+        combined = torch.stack(component_vecs).sum(dim=0).unsqueeze(0)
+
+        old_weight = self.embedding.weight.data
+        device = old_weight.device
+        new_weight = torch.cat([old_weight, combined.to(device)], dim=0)
+        self.embedding = nn.Embedding(new_weight.shape[0], self.embedding_dim)
+        self.embedding.weight.data.copy_(new_weight)
+        self.embedding.weight.requires_grad = False
+        self.embedding = self.embedding.to(device)
+
+        self._category_names.append(name)
+        return len(self._category_names) - 1
+
+    def rebuild_for_mapping(self, new_category_names: list) -> None:
+        """Rebuild the weight matrix for a different category-to-index mapping."""
+        emb_matrix = build_perturbation_embedding_matrix(
+            new_category_names, self._predefined_embeddings, self.combination_delimiter
+        )
+        device = self.embedding.weight.device
+        self.embedding = nn.Embedding(emb_matrix.shape[0], self.embedding_dim)
+        self.embedding.weight.data.copy_(emb_matrix.to(device))
+        self.embedding.weight.requires_grad = False
+        self.embedding = self.embedding.to(device)
+        self._category_names = list(new_category_names)
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.embedding(indices.long())
+
+    @property
+    def weight(self):
+        """Alias so callers expecting ``nn.Embedding`` attributes still work."""
+        return self.embedding.weight
 
 
 class CellDISECTModule(BaseModuleClass):
@@ -63,6 +184,18 @@ class CellDISECTModule(BaseModuleClass):
         Weights for the classifiers, by default None.
     bias : bool, optional
         Whether to use bias in the encoder and decoder layers, by default True.
+    perturbation_cov_idx : Optional[int], optional
+        Index (in the categorical covariates list) of the perturbation covariate.
+        When set, that covariate uses predefined embeddings instead of learned ones.
+    predefined_pert_embeddings : Optional[dict], optional
+        Mapping from atomic perturbation name to its vector representation
+        (e.g. ESM or GenePT embeddings). Required when ``perturbation_cov_idx``
+        is not None.
+    perturbation_category_names : Optional[list], optional
+        Ordered category names for the perturbation covariate (mirrors the
+        integer-index mapping from the AnnData manager).
+    perturbation_combination_delimiter : str, optional
+        Delimiter for combinatorial perturbation labels, by default ``"+"``.
     """
 
     def __init__(
@@ -85,6 +218,10 @@ class CellDISECTModule(BaseModuleClass):
             embeddings: Union[torch.Tensor, List[torch.Tensor]] = None,
             classifier_weights: Optional[list] = None,
             bias: bool = True,
+            perturbation_cov_idx: Optional[int] = None,
+            predefined_pert_embeddings: Optional[Dict[str, np.ndarray]] = None,
+            perturbation_category_names: Optional[list] = None,
+            perturbation_combination_delimiter: str = "+",
     ):
         super().__init__()
         self.dispersion = "gene"
@@ -92,8 +229,8 @@ class CellDISECTModule(BaseModuleClass):
         self.n_latent_attribute = n_latent_attribute
         self.log_variational = log_variational
         self.gene_likelihood = gene_likelihood
-        # Automatically deactivate if useless
         self.latent_distribution = latent_distribution
+        self.perturbation_cov_idx = perturbation_cov_idx
 
         self.px_r = torch.nn.Parameter(torch.randn(n_input))
 
@@ -107,7 +244,17 @@ class CellDISECTModule(BaseModuleClass):
         n_input_encoder = n_input
 
         self.n_cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
-        if use_custom_embs:
+
+        # ---- per-covariate embeddings + projections ----
+        _has_perturbation = (
+            perturbation_cov_idx is not None
+            and predefined_pert_embeddings is not None
+            and perturbation_category_names is not None
+        )
+        self._has_perturbation = _has_perturbation
+
+        if use_custom_embs and not _has_perturbation:
+            # Legacy path: single custom embedding for ALL covariates
             self.covars_embeddings = nn.ModuleDict(
                 {
                     str(key): torch.nn.Embedding(embedding.shape[0], embedding.shape[1])
@@ -116,16 +263,45 @@ class CellDISECTModule(BaseModuleClass):
             )
             self.covars_embeddings['0'].weight.data.copy_(embeddings)
             self.covars_embeddings['0'].weight.requires_grad = False
-        else:
-            self.covars_embeddings = nn.ModuleDict(
-                {
-                    str(key): torch.nn.Embedding(unique_covars, n_latent_shared)
-                    for key, unique_covars in enumerate(self.n_cat_list)
-                }
+            self.emb_projections = nn.ModuleDict(
+                {str(k): nn.Identity() for k in range(len(self.n_cat_list))}
             )
+            emb_dim_reducer = nn.Linear(
+                self.covars_embeddings['0'].weight.shape[1], n_latent_shared
+            )
+            self.pert_encoder = emb_dim_reducer
+        else:
+            self.covars_embeddings = nn.ModuleDict()
+            self.emb_projections = nn.ModuleDict()
 
-        emb_dim_reducer = nn.Linear(self.covars_embeddings['0'].weight.shape[1], n_latent_shared)
-        self.pert_encoder = emb_dim_reducer if use_custom_embs else nn.Identity()
+            for i, n_cats in enumerate(self.n_cat_list):
+                if _has_perturbation and i == perturbation_cov_idx:
+                    pert_emb = PerturbationEmbedding(
+                        predefined_pert_embeddings,
+                        perturbation_category_names,
+                        perturbation_combination_delimiter,
+                    )
+                    self.covars_embeddings[str(i)] = pert_emb
+                    self.emb_projections[str(i)] = nn.Linear(
+                        pert_emb.embedding_dim, n_latent_shared
+                    )
+                else:
+                    self.covars_embeddings[str(i)] = nn.Embedding(n_cats, n_latent_shared)
+                    self.emb_projections[str(i)] = nn.Identity()
+
+            self.pert_encoder = nn.Identity()
+
+        # Determine prior-encoder input size per covariate
+        self._prior_input_dims = []
+        for i in range(len(self.n_cat_list)):
+            if _has_perturbation and i == perturbation_cov_idx:
+                self._prior_input_dims.append(
+                    self.covars_embeddings[str(i)].embedding_dim
+                )
+            elif use_custom_embs and not _has_perturbation:
+                self._prior_input_dims.append(embeddings.shape[1])
+            else:
+                self._prior_input_dims.append(n_latent_shared)
 
         self.zs_num = len(self.n_cat_list)
 
@@ -140,12 +316,10 @@ class CellDISECTModule(BaseModuleClass):
                 Encoder(
                     n_input_encoder + len(self.n_cat_list) * n_latent_shared,
                     n_latent_shared,
-                    # n_cat_list=self.n_cat_list,
                     n_layers=n_layers,
                     n_hidden=n_hidden,
                     dropout_rate=dropout_rate,
                     distribution=latent_distribution,
-                    # inject_covariates=deeply_inject_covariates,
                     use_batch_norm=use_batch_norm_encoder,
                     use_layer_norm=use_layer_norm_encoder,
                     var_activation=var_activation,
@@ -160,12 +334,10 @@ class CellDISECTModule(BaseModuleClass):
                 Encoder(
                     n_input_encoder + len(self.n_cat_list) * n_latent_shared,
                     n_latent_attribute,
-                    # n_cat_list=self.n_cat_list,
                     n_layers=n_layers,
                     n_hidden=n_hidden,
                     dropout_rate=dropout_rate,
                     distribution=latent_distribution,
-                    # inject_covariates=deeply_inject_covariates,
                     use_batch_norm=use_batch_norm_encoder,
                     use_layer_norm=use_layer_norm_encoder,
                     var_activation=var_activation,
@@ -179,14 +351,12 @@ class CellDISECTModule(BaseModuleClass):
         self.z_prior_encoders_list = nn.ModuleList(
             [
                 Encoder(
-                    n_latent_shared if use_custom_embs == False else embeddings.shape[1],
+                    self._prior_input_dims[k],
                     n_latent_attribute,
-                    # n_cat_list=[self.n_cat_list[k]],
                     n_layers=n_layers,
                     n_hidden=n_hidden,
                     dropout_rate=dropout_rate,
                     distribution=latent_distribution,
-                    # inject_covariates=deeply_inject_covariates,
                     use_batch_norm=use_batch_norm_encoder,
                     use_layer_norm=use_layer_norm_encoder,
                     var_activation=var_activation,
@@ -204,10 +374,8 @@ class CellDISECTModule(BaseModuleClass):
                 DecoderSCVI(
                     n_latent_shared + len(self.n_cat_list) * n_latent_shared,
                     n_input,
-                    # n_cat_list=self.n_cat_list,
                     n_layers=n_layers,
                     n_hidden=n_hidden,
-                    # inject_covariates=deeply_inject_covariates,
                     use_batch_norm=use_batch_norm_decoder,
                     use_layer_norm=use_layer_norm_decoder,
                     scale_activation="softmax",
@@ -220,10 +388,8 @@ class CellDISECTModule(BaseModuleClass):
                 DecoderSCVI(
                     n_latent_attribute * len(self.n_cat_list),
                     n_input,
-                    # n_cat_list=[self.n_cat_list[i] for i in range(len(self.n_cat_list)) if i != k],
                     n_layers=n_layers,
                     n_hidden=n_hidden,
-                    # inject_covariates=deeply_inject_covariates,
                     use_batch_norm=use_batch_norm_decoder,
                     use_layer_norm=use_layer_norm_decoder,
                     scale_activation="softmax",
@@ -300,6 +466,48 @@ class CellDISECTModule(BaseModuleClass):
         }
         return input_dict
 
+    # ------------------------------------------------------------------
+    # Embedding helper
+    # ------------------------------------------------------------------
+    def _get_covariate_embeddings(self, cat_covs: torch.Tensor):
+        """Look up embeddings for every covariate and project them.
+
+        Returns
+        -------
+        emb_flat
+            ``(batch, n_covs * n_latent_shared)`` -- projected & flattened,
+            ready to concatenate with gene expression for encoders / Dec_0.
+        raw_embs
+            List of length ``n_covs``, each ``(batch, raw_dim_i)`` -- the raw
+            (unprojected) embeddings used as input for prior encoders.
+        projected_3d
+            ``(n_covs, batch, n_latent_shared)`` -- projected embeddings kept
+            in 3-D so callers can easily select subsets for decoders.
+        """
+        raw_embs = []
+        projected_embs = []
+        for i, embedding_indices in enumerate(cat_covs.t()):
+            raw = self.covars_embeddings[str(i)](embedding_indices.long())
+            raw_embs.append(raw)
+            projected = self.emb_projections[str(i)](raw)
+            projected_embs.append(projected)
+
+        # Legacy path (use_custom_embs without perturbation): apply batch pert_encoder
+        if not isinstance(self.pert_encoder, nn.Identity):
+            stacked = torch.stack(raw_embs, dim=1)          # (B, n_covs, raw_dim)
+            projected_all = self.pert_encoder(stacked)       # (B, n_covs, n_latent_shared)
+            projected_embs = list(projected_all.unbind(dim=1))
+
+        projected_3d = torch.stack(projected_embs, dim=0)    # (n_covs, B, n_latent_shared)
+        emb_flat = projected_3d.permute(1, 0, 2).reshape(
+            projected_3d.shape[1], -1
+        )  # (B, n_covs * n_latent_shared)
+        return emb_flat, raw_embs, projected_3d
+
+    # ------------------------------------------------------------------
+    # Inference / generative / forward helpers
+    # ------------------------------------------------------------------
+
     @auto_move_data
     def inference(self,
                   x,
@@ -333,32 +541,18 @@ class CellDISECTModule(BaseModuleClass):
         if self.log_variational:
             x_ = torch.log(1 + x_)
 
-        # cat_covs are shaped like (batch_size, n_cat_covs)
-        # we split them into a list of n_cat_covs (batch_size, 1) tensors
-        # where each tensor is a column of cat_covs (each will contain one categorical covariate)
         cat_in = torch.split(cat_covs, 1, dim=1)
-        # z_shared
-        emb = []
-        for i, embedding in enumerate(cat_covs.t()):
-            # emb will be a list of embeddings for each categorical covariate
-            # for the batch. Each embedding is of shape (batch_size, emb_dim)
-            emb.append(self.covars_embeddings[str(i)](embedding.long()))
 
-        prior_emb_in = emb[:] # save a copy for later
-        emb = torch.stack(emb, dim=0) # unique_covs x batch_size x emb_dim
-        emb = torch.permute(emb, (1, 0, 2)) # batch_size x unique_covs x emb_dim
-        emb = self.pert_encoder(emb)
-        emb = emb.reshape(emb.shape[0], -1) # batch_size x (unique_covs * emb_dim)
-        # each row in emb now represents the embedding for all covariates in that single cell
+        emb_flat, raw_embs, _ = self._get_covariate_embeddings(cat_covs)
 
         # the expression data and the embeddings are concatenated
         # and passed through the first encoder to get the shared latent space Z_0
-        qz_shared, z_shared = self.z_encoders_list[0](torch.hstack((x_, emb)))
+        qz_shared, z_shared = self.z_encoders_list[0](torch.hstack((x_, emb_flat)))
         z_shared = z_shared.to(device)
     
         # zs
         encoders_outputs = []
-        encoders_inputs = [torch.hstack((x_, emb)) for _ in cat_in]
+        encoders_inputs = [torch.hstack((x_, emb_flat)) for _ in cat_in]
 
         for i in range(len(self.z_encoders_list) - 1):
             encoders_outputs.append(self.z_encoders_list[i + 1](encoders_inputs[i]))
@@ -366,10 +560,11 @@ class CellDISECTModule(BaseModuleClass):
         qzs = [enc_out[0] for enc_out in encoders_outputs]
         zs = [enc_out[1].to(device) for enc_out in encoders_outputs]
         
-        # zs_prior
+        # zs_prior (use raw embeddings as input -- prior encoders accept
+        # the native embedding dimension for each covariate)
         encoders_prior_outputs = []
         for i in range(len(self.z_prior_encoders_list)):
-            encoders_prior_outputs.append(self.z_prior_encoders_list[i](prior_emb_in[i]))
+            encoders_prior_outputs.append(self.z_prior_encoders_list[i](raw_embs[i]))
 
         qzs_prior = [enc_out[0] for enc_out in encoders_prior_outputs]
         zs_prior = [enc_out[1].to(device) for enc_out in encoders_prior_outputs]
@@ -430,45 +625,29 @@ class CellDISECTModule(BaseModuleClass):
 
         z = [z_shared] + zs
 
-        cats_splits = torch.split(cat_covs, 1, dim=1)
-        emb = []
-        for i, embedding in enumerate(cat_covs.t()):
-            emb.append(self.covars_embeddings[str(i)](embedding.long()))
-        emb = torch.stack(emb, dim=0) # unique_covs x batch_size x emb_dim
-        full_embs_ubd = emb.clone() # unique_covs x batch_size x emb_dim
-        emb = torch.permute(emb, (1, 0, 2)) # batch_size x unique_covs x emb_dim
-        emb = self.pert_encoder(emb)
-        emb = emb.reshape(emb.shape[0], -1) # batch_size x (unique_covs * emb_dim)
-        # each row in emb now represents the embedding for all covariates in that single cell
+        emb_flat, _, projected_3d = self._get_covariate_embeddings(cat_covs)
 
         # Create embeddings for all covariates except the ith one for the decoder
         all_cats_but_one = []
-        for i in range(self.zs_num): # for each categorical covariate
-            cov_indices = list(set(range(self.zs_num)) - {i}) # all indices except i
-            # embeddings for all covariates except the ith one
-            ith_emb = full_embs_ubd[cov_indices, :, :] # (unique_covs-1) x batch_size x emb_dim
-            ith_emb = torch.permute(ith_emb, (1, 0, 2)) # batch_size x (unique_covs-1) x emb_dim
-            ith_emb = ith_emb.reshape(ith_emb.shape[0], -1) # batch_size x ((unique_covs-1) * emb_dim)
+        for i in range(self.zs_num):
+            cov_indices = list(set(range(self.zs_num)) - {i})
+            ith_emb = projected_3d[cov_indices, :, :]         # (n-1, B, n_latent_shared)
+            ith_emb = ith_emb.permute(1, 0, 2)                # (B, n-1, n_latent_shared)
+            ith_emb = ith_emb.reshape(ith_emb.shape[0], -1)   # (B, (n-1)*n_latent_shared)
             all_cats_but_one.append(ith_emb)
 
-        # Covariate embeddings for decoders
-        # Dec_0 takes all covariates
-        # Dec_i takes all covariates except the ith one
-        dec_cats_in = [emb] + all_cats_but_one
+        # Dec_0 takes all covariates; Dec_i takes all covariates except i
+        dec_cats_in = [emb_flat] + all_cats_but_one
 
         for dec_count in range(self.zs_num + 1):
-            # Decoder_i
             x_decoder = self.x_decoders_list[dec_count]
-            # Decoder_i covariates
             dec_covs = dec_cats_in[dec_count]
-            # Decoder_i latent input
             x_decoder_input = z[dec_count]
             
             px_scale, px_r, px_rate, px_dropout = x_decoder(
                 self.dispersion,
                 torch.hstack((x_decoder_input, dec_covs)),
                 library,
-                # *dec_covs
             )
             px_r = torch.exp(self.px_r)
 
@@ -520,27 +699,17 @@ class CellDISECTModule(BaseModuleClass):
         if self.log_variational:
             x_ = torch.log(1 + x_)
 
-        cat_in = torch.split(cat_covs, 1, dim=1)
+        emb_flat, _, projected_3d = self._get_covariate_embeddings(cat_covs)
         
-        emb = []
-        for i, embedding in enumerate(cat_covs.t()):
-            emb.append(self.covars_embeddings[str(i)](embedding.long()))
-        emb = torch.stack(emb, dim=0)
-        full_embs_ubd = emb.clone() # unique_covs x batch_size x emb_dim
-        emb = torch.permute(emb, (1, 0, 2))
-        emb = self.pert_encoder(emb)
-        emb = emb.reshape(emb.shape[0], -1)
-        
-        qz, z = (self.z_encoders_list[idx](torch.hstack((x_, emb))))
+        qz, z = (self.z_encoders_list[idx](torch.hstack((x_, emb_flat))))
         
         if detach_z:
             z = z.detach()
 
-        for i in range(self.zs_num):
-            cov_indices = list(set(list(range(self.zs_num)))-set([idx-1]))
-            ith_emb = full_embs_ubd[cov_indices, :, :]
-            ith_emb = torch.permute(ith_emb, (1, 0, 2))
-            ith_emb = ith_emb.reshape(ith_emb.shape[0], -1)    
+        cov_indices = list(set(range(self.zs_num)) - {idx - 1})
+        ith_emb = projected_3d[cov_indices, :, :]
+        ith_emb = ith_emb.permute(1, 0, 2)
+        ith_emb = ith_emb.reshape(ith_emb.shape[0], -1)
 
         x_decoder = self.x_decoders_list[idx]
 
@@ -548,7 +717,6 @@ class CellDISECTModule(BaseModuleClass):
             self.dispersion,
             torch.hstack((z, ith_emb)),
             library,
-            # *dec_cats
         )
         px_r = torch.exp(self.px_r)
 
@@ -628,49 +796,28 @@ class CellDISECTModule(BaseModuleClass):
         if self.log_variational:
             x_ = torch.log(1 + x_)
 
-        emb = []
-        for i, embedding in enumerate(cat_covs.t()):
-            emb.append(self.covars_embeddings[str(i)](embedding.long()))
-        emb = torch.stack(emb, dim=0)
-        full_embs_ubd = emb.clone() # unique_covs x batch_size x emb_dim
-        emb = torch.permute(emb, (1, 0, 2))
-        emb = self.pert_encoder(emb)
-        emb = emb.reshape(emb.shape[0], -1)
+        emb_flat, _, projected_3d = self._get_covariate_embeddings(cat_covs)
 
-        qz, z = (self.z_encoders_list[idx](torch.hstack((x_, emb))))
-        # TLDR: we encode the original gene expression and covariates of the cell using encoder idx
-        # so z is the latent representation of the original cell, nothing about the counterfactual yet
+        qz, z = (self.z_encoders_list[idx](torch.hstack((x_, emb_flat))))
 
         if detach_z:
             z = z.detach()
 
         if cat_covs_cf is None:
             cov_indices = list(set(range(self.zs_num)) - {idx - 1})
-            ith_emb = full_embs_ubd[cov_indices, :, :]
-            ith_emb = torch.permute(ith_emb, (1, 0, 2))
-            ith_emb = self.pert_encoder(ith_emb)
+            ith_emb = projected_3d[cov_indices, :, :]
+            ith_emb = ith_emb.permute(1, 0, 2)
             ith_emb = ith_emb.reshape(ith_emb.shape[0], -1)
         else:
-            # Here's where the counterfactual decoding is happening
-
             # If there is only one covariate, the attribute-specific decoder (decoder_i for i > 0)
-            # cannot be used for counterfactual predictions. This is because its latent space is
-            # conditioned on that single covariate, and the decoder input requires embeddings from
-            # all *other* covariates. When only one exists, there are no "other" covariates to condition on.
-            # By returning None, we ensure that for single-covariate counterfactuals, the model gracefully
-            # ignores this decoder and relies only on the shared decoder (decoder_0), which is the
-            # correct behavior.
+            # cannot be used for counterfactual predictions.
             if self.zs_num == 1:
                 return None
-            ith_emb = []
-            for i, embedding in enumerate(cat_covs_cf.t()):
-                if i == idx-1:
-                    continue
-                ith_emb.append(self.covars_embeddings[str(i)](embedding.long()))
-            ith_emb = torch.stack(ith_emb, dim=0) # (n_cat_covs-1) x batch_size x emb_dim
-            ith_emb = torch.permute(ith_emb, (1, 0, 2)) # batch_size x (n_cat_covs-1) x emb_dim
-            ith_emb = self.pert_encoder(ith_emb)
-            ith_emb = ith_emb.reshape(ith_emb.shape[0], -1) # batch_size x ((n_cat_covs-1) * emb_dim)
+            _, _, cf_proj_3d = self._get_covariate_embeddings(cat_covs_cf)
+            cov_indices = [i for i in range(self.zs_num) if i != idx - 1]
+            ith_emb = cf_proj_3d[cov_indices, :, :]
+            ith_emb = ith_emb.permute(1, 0, 2)
+            ith_emb = ith_emb.reshape(ith_emb.shape[0], -1)
 
         x_decoder = self.x_decoders_list[idx]
 
@@ -678,25 +825,13 @@ class CellDISECTModule(BaseModuleClass):
             self.dispersion,
             torch.hstack((z, ith_emb)),
             library,
-            # *dec_cats
         )
         px_r = torch.exp(self.px_r)
         cf_difference = (cat_covs == cat_covs_cf).to(device)
-        # px is of shape (batch_size, n_input)
-        # cf_difference[:, idx-1] is a boolean tensor of shape (batch_size,) where True means
-        # the covariate is the same as the original covariate in that cell(hasn't changed)
-        # This is important:
-        # We are currently in enc/dec idx, latent idx is aware of the covariate idx-1
-        # so if covariate idx-1 has been changed in the cf, outputs from dec idx will be incorrect
-        # because they are not getting the new covariate idx-1 value when decoding (decoder i gets covariates except i)
-        # decoder idx is going to keep the original covariate idx-1 value
-        # So we need to filter out the cells where covariate idx-1 has been changed
         px_scale = px_scale[cf_difference[:, idx-1]]
         px_rate = px_rate[cf_difference[:, idx-1]]
         px_dropout = px_dropout[cf_difference[:, idx-1]]
         if px_scale.shape[0] == 0:
-            # if all cells in the batch have their covariate idx-1 changed
-            # there won't be any output from the decoder idx
             return None
 
         if self.gene_likelihood == "zinb":
@@ -747,52 +882,28 @@ class CellDISECTModule(BaseModuleClass):
         library = torch.log(x_.sum(1)).unsqueeze(1)
         if self.log_variational:
             x_ = torch.log(1 + x_)
+
+        emb_flat, _, projected_3d = self._get_covariate_embeddings(cat_covs)
         
-        emb = []
-        for i, embedding in enumerate(cat_covs.t()):
-            emb.append(self.covars_embeddings[str(i)](embedding.long()))
-        emb = torch.stack(emb, dim=0)
-        full_embs_ubd = emb.clone() # unique_covs x batch_size x emb_dim
-        emb = torch.permute(emb, (1, 0, 2))
-        emb = self.pert_encoder(emb)
-        emb = emb.reshape(emb.shape[0], -1)
-        
-        qz, z = (self.z_encoders_list[0](torch.hstack((x_, emb)))) # z0
-        # TLDR: we encode the original gene expression and covariates of the cell using encoder 0
-        # so z is the latent representation of the original cell, nothing about the counterfactual yet
+        qz, z = (self.z_encoders_list[0](torch.hstack((x_, emb_flat))))
         
         if detach_z:
             z = z.detach()
 
         if cat_covs_cf is None:
-            cov_indices = list(set(list(range(self.zs_num))))
-            ith_emb = full_embs_ubd[cov_indices, :, :]
-            ith_emb = torch.permute(ith_emb, (1, 0, 2))
-            ith_emb = self.pert_encoder(ith_emb)
-            ith_emb = ith_emb.reshape(ith_emb.shape[0], -1)
+            ith_emb = projected_3d.permute(1, 0, 2)           # (B, n_covs, n_latent_shared)
+            ith_emb = ith_emb.reshape(ith_emb.shape[0], -1)   # (B, n_covs * n_latent_shared)
         else:
-            # Here's where the counterfactual decoding is happening
-            ith_emb = []
-            for i, embedding in enumerate(cat_covs_cf.t()):
-                ith_emb.append(self.covars_embeddings[str(i)](embedding.long()))
-            # decoder 0 takes all covariates because its latent is unaware of all covariates
-            ith_emb = torch.stack(ith_emb, dim=0) # n_cat_covs x batch_size x emb_dim
-            ith_emb = torch.permute(ith_emb, (1, 0, 2)) # batch_size x n_cat_covs x emb_dim
-            ith_emb = self.pert_encoder(ith_emb)
-            ith_emb = ith_emb.reshape(ith_emb.shape[0], -1) # batch_size x (n_cat_covs * emb_dim)
+            cf_emb_flat, _, _ = self._get_covariate_embeddings(cat_covs_cf)
+            ith_emb = cf_emb_flat
 
-        # decoder 0
+        # decoder 0 takes all covariates and is unaware of them in its latent
         x_decoder = self.x_decoders_list[0]
 
-        # Note: decoder 0 takes all covariates and is unaware of them in its latent representation
-        # therefore we can change all the covariates here while decoding without any issues
-        # even if all the covariates are changed and we can't use decoders 1, ..., zs_num we can
-        # always use decoder 0 to get the counterfactual gene expression without any issues.
         px_scale, px_r, px_rate, px_dropout = x_decoder(
             self.dispersion,
             torch.hstack((z, ith_emb)),
             library,
-            # *dec_cats
         )
         px_r = torch.exp(self.px_r)
 

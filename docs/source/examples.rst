@@ -2,10 +2,11 @@
 Example Scripts
 =================
 
-CellDISECT comes with two essential example scripts that demonstrate the complete workflow for training and inference. These scripts are located in the ``examples/`` directory of the repository:
+CellDISECT comes with example scripts that demonstrate the complete workflow for training, inference, and perturbation prediction. These scripts are located in the ``examples/`` directory of the repository:
 
 * `training_example.py <https://github.com/Lotfollahi-lab/CellDISECT/blob/main/examples/training_example.py>`_
 * `inference_example.py <https://github.com/Lotfollahi-lab/CellDISECT/blob/main/examples/inference_example.py>`_
+* `perturbation_example.py <https://github.com/Lotfollahi-lab/CellDISECT/blob/main/examples/perturbation_example.py>`_
 
 Training Example
 -----------------
@@ -134,5 +135,50 @@ Using the Examples
    - Use the same covariate list as during training
    - Specify the correct path to your trained model
    - Adjust the output path for saving results
+
+Perturbation Example
+---------------------
+
+The ``perturbation_example.py`` script demonstrates how to use CellDISECT for perturbation prediction. It covers:
+
+1. **Preparing predefined embeddings**:
+
+.. code-block:: python
+
+    # Load gene embeddings (e.g. GenePT, ESM)
+    gene_embeddings = np.load('PATH/TO/GENE_EMBEDDINGS.npy', allow_pickle=True).item()
+    adata.uns['pert_embeddings'] = gene_embeddings
+
+2. **Setting up with perturbation support**:
+
+.. code-block:: python
+
+    CellDISECT.setup_anndata(
+        adata,
+        layer='counts',
+        categorical_covariate_keys=['cell_type', 'perturbation'],
+        perturbation_key='perturbation',
+        perturbation_embedding_key='pert_embeddings',
+        perturbation_combination_delimiter='+',
+    )
+
+3. **Predicting perturbations** (seen, unseen, or combinatorial):
+
+.. code-block:: python
+
+    x_ctrl, x_true, x_pred = model.predict_perturbation(
+        adata,
+        perturbation='GeneA+GeneB',
+        source_perturbation='ctrl',
+        cats=['cell_type', 'perturbation'],
+        perturbation_key='perturbation',
+    )
+
+4. **Evaluating predictions**:
+
+.. code-block:: python
+
+    from celldisect import perturbation_metrics
+    metrics = perturbation_metrics(x_pred.numpy(), x_true.numpy(), x_ctrl.numpy())
 
 These scripts serve as comprehensive templates for working with CellDISECT and can be adapted to your specific use case. 
