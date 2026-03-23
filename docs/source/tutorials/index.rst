@@ -38,7 +38,7 @@ Beginner Tutorials
         :doc:`Open Notebook <CellDISECT_Counterfactual.ipynb>`
 
 Perturbation Prediction
-~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
 
 .. grid:: 2
 
