@@ -7,8 +7,8 @@ project = 'CellDISECT'
 copyright = '2024, Arian Amani, Stathis Megas'
 author = 'Arian Amani, Stathis Megas'
 
-# The full version, including alpha/beta/rc tags
-release = '0.1.1'
+import celldisect
+release = celldisect.__version__
 version = '.'.join(release.split('.')[:2])  # Major.Minor version
 
 # General configuration
@@ -94,7 +94,6 @@ html_theme_options = {
     'titles_only': False,
     'body_max_width': 'none',  # Responsive layout
     'navigation_with_keys': True,  # Keyboard navigation
-    'canonical_url': 'https://celldisect.readthedocs.io/en/latest/',
 }
 
 # Version display settings
@@ -173,7 +172,7 @@ autodoc_docstring_signature = True
 nbsphinx_execute = 'never'
 nbsphinx_allow_errors = True
 nbsphinx_kernel_name = 'python3'
-nbsphinx_prompt_width = 0
+nbsphinx_prompt_width = '0'
 
 
 # Add notebooks to the patterns of files to copy

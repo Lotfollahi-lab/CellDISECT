@@ -1,5 +1,14 @@
 setuptools>=65.0.0
 sphinx>=4.5.0
+scanpy
+anndata
+scvi-tools
+torch
+lightning
+scipy
+pandas
+numpy
+importlib-metadata
 sphinx-rtd-theme>=1.0.0
 sphinx-autodoc-typehints>=1.18.3
 sphinx-gallery>=0.10.1
