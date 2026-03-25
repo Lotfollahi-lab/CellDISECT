@@ -9,6 +9,7 @@ homepage = "https://github.com/Lotfollahi-lab/CellDISECT"
 
 [tool.poetry.dependencies]
 python = ">=3.9, <3.11"
+setuptools = ">=65.0.0"
 llvmlite = "^0.42"
 anndata = ">=0.10.8, <0.10.9"
 scvi-tools = ">=0.20.3,<1.0.0"
