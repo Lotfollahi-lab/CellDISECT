@@ -1,14 +1,49 @@
 import os
 import sys
+from pathlib import Path
+
 sys.path.insert(0, os.path.abspath('../..'))
+
+# Mock heavy dependencies to avoid build issues on Read the Docs
+autodoc_mock_imports = [
+    "torch",
+    "scvi",
+    "lightning",
+    "pytorch_lightning",
+    "lightning_fabric",
+    "sklearn",
+    "scipy",
+    "pandas",
+    "numpy",
+    "jax",
+    "jaxlib",
+    "ray",
+    "gdown",
+    "adjustText",
+    "seaborn",
+    "matplotlib",
+    "anndata",
+    "scanpy",
+]
+
+# Read version from pyproject.toml without importing the package
+def get_version():
+    try:
+        pyproject_path = Path(__file__).parent.parent.parent / "pyproject.toml"
+        with open(pyproject_path, "r") as f:
+            for line in f:
+                if line.strip().startswith("version ="):
+                    return line.split("=")[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return '0.1.6'
 
 # Project information
 project = 'CellDISECT'
 copyright = '2024, Arian Amani, Stathis Megas'
 author = 'Arian Amani, Stathis Megas'
 
-import celldisect
-release = celldisect.__version__
+release = get_version()
 version = '.'.join(release.split('.')[:2])  # Major.Minor version
 
 # General configuration
