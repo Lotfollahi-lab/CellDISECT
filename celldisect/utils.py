@@ -220,6 +220,10 @@ def perturbation_metrics(
         arr = np.asarray(arr, dtype=np.float64)
         return arr.mean(axis=0) if arr.ndim == 2 else arr
 
+    pred = np.log1p(pred)
+    true = np.log1p(true)
+    ctrl = np.log1p(ctrl)
+
     pred_mean = _to_1d(pred)
     true_mean = _to_1d(true)
     ctrl_mean = _to_1d(ctrl)
