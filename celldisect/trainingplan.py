@@ -336,7 +336,8 @@ class CellDISECTTrainingPlan(TrainingPlan):
                 if j == 0:
                     z = z_shared
                 else:
-                    z = zs[j-1]
+                    available_attrs = [k for k in range(self.zs_num) if k != i]
+                    z = zs[available_attrs[j - 1]]
                 adv_clf_i = self.adv_clf_list[i*self.zs_num + j]  # Each covariate has n classifiers: Z0, Zi (i != covariate)
                 logits_i = adv_clf_i(z)
                 logits += [logits_i]

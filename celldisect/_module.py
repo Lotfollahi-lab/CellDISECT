@@ -1169,8 +1169,16 @@ class CellDISECTModule(BaseModuleClass):
         kl_z_list = [torch.mean(kl(qzs, qzs_prior).sum(dim=1)) for qzs, qzs_prior in
                      zip(inference_outputs["qzs"], inference_outputs["qzs_prior"])]
 
-        kl_z_dict = {'z_' + str(i+1): kl_z_list[i] for i in range(len(kl_z_list))}
-        kl_loss = sum(kl_z_list) / len(kl_z_list)
+        # KL divergence for unsupervised shared latent space (z_shared)
+        # Prior is standard normal N(0, I)
+        from torch.distributions import Normal
+        qz_shared = inference_outputs["qz_shared"]
+        prior_z_shared = Normal(torch.zeros_like(qz_shared.mean).to(device), torch.ones_like(qz_shared.scale).to(device))
+        kl_z_shared = torch.mean(kl(qz_shared, prior_z_shared).sum(dim=1))
+
+        kl_z_dict = {'z_0': kl_z_shared}
+        kl_z_dict.update({'z_' + str(i+1): kl_z_list[i] for i in range(len(kl_z_list))})
+        kl_loss = (kl_z_shared + sum(kl_z_list)) / (1 + len(kl_z_list))
 
         # classification metrics: CE, ACC, F1
 
